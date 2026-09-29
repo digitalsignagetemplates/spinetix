@@ -16,6 +16,7 @@ import ssl
 import base64
 import ipaddress
 import socket
+import shutil
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -27,11 +28,14 @@ from xml.sax.saxutils import escape as xml_escape
 PORT = 8090
 BIND_HOST = '127.0.0.1'  # localhost only, not exposed to network
 SCAN_TIMEOUT = 6  # seconds for mDNS browse
+MDNS_AVAILABLE = shutil.which('dns-sd') is not None  # macOS, or Windows with Bonjour
 MAX_SCAN_HOSTS = 4096  # max IPs per subnet scan (a /20)
 SCAN_WORKERS = 128  # parallel probes during subnet scan
 PROBE_CONNECT_TIMEOUT = 0.8  # seconds for TCP connect to port 443
 PROBE_HTTP_TIMEOUT = 4  # seconds for identification request
-REBOOT_WAIT = 60  # seconds to wait after reboot
+REBOOT_WAIT = 30  # seconds before first check after reboot
+REBOOT_MAX_WAIT = 300  # total seconds to wait for the player to come back
+REBOOT_POLL_INTERVAL = 10  # seconds between checks after reboot
 MAX_REQUEST_SIZE = 1024 * 1024  # 1MB max request body
 ALLOWED_ORIGIN = f'http://localhost:{PORT}'
 
@@ -141,6 +145,7 @@ def _scan_mdns():
                 if len(parts) >= 7:
                     instances.append(' '.join(parts[6:]))
     except FileNotFoundError:
+        # No Bonjour (e.g. Windows without Bonjour SDK): ARP table only
         return _scan_arp_fallback()
     except Exception as e:
         print(f"Scan error: {e}")
@@ -177,16 +182,15 @@ def _resolve_player(instance_name):
         if not hostname:
             return None
 
-        # Resolve hostname to IP
-        proc2 = subprocess.run(
-            ['ping', '-c', '1', '-t', '2', hostname],
-            capture_output=True, text=True, timeout=5
-        )
+        # Resolve hostname to IPv4 (mDNS .local works via the system resolver
+        # on macOS and on Windows with Bonjour; ping flags differ per OS)
         ip = None
-        for line in proc2.stdout.splitlines():
-            if 'PING' in line and '(' in line:
-                ip = line.split('(')[1].split(')')[0]
-                break
+        try:
+            infos = socket.getaddrinfo(hostname.rstrip('.'), 443, socket.AF_INET, socket.SOCK_STREAM)
+            if infos:
+                ip = infos[0][4][0]
+        except OSError:
+            pass
 
         if not ip:
             return None
@@ -215,31 +219,42 @@ def _resolve_player(instance_name):
         return None
 
 
+SPINETIX_MAC_PREFIX = '00:1D:50'
+_ARP_IP_RE = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b')
+_ARP_MAC_RE = re.compile(r'\b([0-9a-fA-F]{1,2}(?:[:-][0-9a-fA-F]{1,2}){5})\b')
+
+
+def _normalize_mac(raw):
+    """'0:1d:50:22:27:82' (macOS) or '00-1d-50-22-27-82' (Windows) -> '00:1D:50:22:27:82'."""
+    return ':'.join(o.zfill(2) for o in re.split(r'[:-]', raw)).upper()
+
+
 def _scan_arp_fallback():
-    """Fallback: scan ARP table for SpinetiX devices (MAC prefix 00:1d:50)."""
+    """Fallback: scan ARP table for SpinetiX devices (MAC prefix 00:1d:50).
+    Handles both macOS/Linux ('? (10.0.0.5) at 0:1d:50:..') and Windows
+    ('  10.0.0.5   00-1d-50-..   dynamic') output. Only sees hosts the
+    computer recently talked to in its own VLAN."""
     players = []
     try:
         result = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=5)
+        seen = set()
         for line in result.stdout.splitlines():
-            if '0:1d:50' in line.lower() or '00:1d:50' in line.lower():
-                parts = line.split()
-                ip = None
-                mac = None
-                for p in parts:
-                    if p.startswith('(') and p.endswith(')'):
-                        ip = p[1:-1]
-                    if ':' in p and len(p) >= 11:
-                        mac_candidate = p.lower()
-                        if '1d:50' in mac_candidate:
-                            mac = mac_candidate.upper()
-                if ip and _validate_ip(ip):
-                    players.append({
-                        'ip': ip,
-                        'model': 'HMP',
-                        'serial': '',
-                        'mac': mac or '',
-                        'hostname': '',
-                    })
+            ip_m = _ARP_IP_RE.search(line)
+            mac_m = _ARP_MAC_RE.search(line)
+            if not ip_m or not mac_m:
+                continue
+            mac = _normalize_mac(mac_m.group(1))
+            ip = ip_m.group(1)
+            if not mac.startswith(SPINETIX_MAC_PREFIX) or ip in seen or not _validate_ip(ip):
+                continue
+            seen.add(ip)
+            players.append({
+                'ip': ip,
+                'model': 'HMP',
+                'serial': '',
+                'mac': mac,
+                'hostname': '',
+            })
     except Exception as e:
         print(f"ARP fallback error: {e}")
     return players
@@ -310,10 +325,23 @@ def _mac_from_hostname(hostname):
     return ':'.join(raw[i:i+2] for i in range(0, 12, 2)).upper()
 
 
+def _peer_cert_text(ip):
+    """Return the player's TLS certificate (DER) as lowercase latin-1 text, so
+    subject/issuer strings like 'SpinetiX' or 'spx-hmp-<mac>' can be matched
+    without credentials. Returns '' on failure."""
+    try:
+        with socket.create_connection((ip, 443), timeout=PROBE_HTTP_TIMEOUT) as sock:
+            with _player_ssl_context().wrap_socket(sock, server_hostname=None) as tls:
+                der = tls.getpeercert(binary_form=True) or b''
+        return der.decode('latin-1').lower()
+    except (OSError, ValueError):
+        return ''
+
+
 def _identify_player(ip):
     """Check whether a host with an open HTTPS port is a SpinetiX player.
     Uses unauthenticated signals only (no credentials are sent to unknown hosts):
-    reverse DNS name, Server header, auth realm and the login page body.
+    reverse DNS name, TLS certificate, Server header, auth realm and login page body.
     Returns (is_spinetix, info dict)."""
     info = {'ip': ip, 'model': 'HMP', 'serial': '', 'mac': '', 'hostname': ''}
     signals = []
@@ -326,6 +354,12 @@ def _identify_player(ip):
             info['mac'] = _mac_from_hostname(hostname)
     except (OSError, UnicodeError):
         pass
+
+    cert = _peer_cert_text(ip)
+    if 'spinetix' in cert or 'spx-hmp' in cert:
+        signals.append('cert')
+        if not info['mac']:
+            info['mac'] = _mac_from_hostname(cert)
 
     for path in ('/status/info', '/'):
         try:
@@ -412,6 +446,24 @@ def _rpc_call(ip, method, params, username, password, timeout=10):
 
     resp = urllib.request.urlopen(req, context=_player_ssl_context(), timeout=timeout)
     return json.loads(resp.read().decode())
+
+
+def _describe_error(e):
+    """Short human readable reason for a failed player request."""
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 401:
+            return 'HTTP 401, credentials geweigerd'
+        return f'HTTP {e.code}'
+    reason = getattr(e, 'reason', e)
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return 'geen antwoord (timeout)'
+    if isinstance(reason, ConnectionRefusedError):
+        return 'verbinding geweigerd'
+    if isinstance(reason, ssl.SSLError):
+        return 'SSL-fout'
+    if isinstance(reason, OSError):
+        return f'netwerkfout: {reason.strerror or reason}'
+    return type(e).__name__
 
 
 def _mac_to_auth_hash(mac):
@@ -634,22 +686,32 @@ def provision_player(ip, username, password, screen_url, mac=''):
         # Step 2: Reboot
         log("Player herstarten...")
         _rpc_call(ip, 'restart', [], username, password)
-        log(f"Wacht {REBOOT_WAIT}s op herstart...")
+        log(f"Wachten tot player terug is (max {REBOOT_MAX_WAIT // 60} minuten)...")
         time.sleep(REBOOT_WAIT)
 
         # Step 3: Wait for player to come back
-        log("Verbinding controleren...")
-        for attempt in range(6):
+        start = time.time()
+        deadline = start - REBOOT_WAIT + REBOOT_MAX_WAIT
+        last_error = ''
+        last_logged = 0
+        while True:
             try:
                 _rpc_call(ip, 'get_info', [], username, password, timeout=5)
-                log("Player is terug online")
+                log(f"Player is terug online (na {int(time.time() - start) + REBOOT_WAIT}s)")
                 break
-            except Exception:
-                if attempt < 5:
-                    time.sleep(10)
-                else:
-                    log("Player reageert niet na herstart")
-                    return {'success': False, 'steps': steps, 'error': 'Timeout na herstart'}
+            except Exception as e:
+                last_error = _describe_error(e)
+            elapsed = int(time.time() - start) + REBOOT_WAIT
+            if time.time() >= deadline:
+                log(f"Player reageert niet na {elapsed}s (laatste fout: {last_error})")
+                log("Cloud is al uitgeschakeld. Gebruik 'Alleen content pushen' zodra de player "
+                    "bereikbaar is. Controleer of het IP-adres na de herstart gewijzigd is.")
+                return {'success': False, 'steps': steps, 'auth_hash': auth_hash,
+                        'error': f'Timeout na herstart ({last_error})'}
+            if elapsed - last_logged >= 30:
+                log(f"Nog niet bereikbaar na {elapsed}s ({last_error}), blijft proberen...")
+                last_logged = elapsed
+            time.sleep(REBOOT_POLL_INTERVAL)
 
         # Step 4: Push bridge SVG with RDM polling
         log("Bridge SVG pushen (content + RDM polling)...")
@@ -684,8 +746,8 @@ def provision_player(ip, username, password, screen_url, mac=''):
             log(f"Claim code voor CMS: {auth_hash}")
             return {'success': True, 'steps': steps, 'auth_hash': auth_hash}
 
-    except Exception:
-        log("Fout tijdens provisioning")
+    except Exception as e:
+        log(f"Fout tijdens provisioning: {_describe_error(e)}")
         return {'success': False, 'steps': steps, 'error': 'Provisioning mislukt'}
 
 
@@ -908,7 +970,8 @@ async function scanPlayers() {
     players = data.players || [];
     manual.forEach(m => { if (!players.some(p => p.ip === m.ip)) players.push(m); });
     renderPlayers();
-    status.textContent = players.length + ' player(s) gevonden';
+    status.textContent = players.length + ' player(s) gevonden' +
+      (data.mdns === false ? '. Let op: mDNS is niet beschikbaar op deze computer (alleen macOS of Windows met Bonjour), vul ook je eigen subnet in bij "Extra subnets".' : '');
   } catch (e) {
     status.textContent = 'Scan mislukt: ' + e.message;
   }
@@ -1056,6 +1119,7 @@ async function startProvision() {
   const log = document.getElementById('provisionLog');
   log.innerHTML = '';
   document.getElementById('screenshotArea').innerHTML = '';
+  appendLog(log, 'Bezig met provisionen, dit duurt 1 tot 5 minuten (inclusief herstart)...', false);
 
   try {
     const data = await api('/provision', {
@@ -1064,6 +1128,7 @@ async function startProvision() {
       password: document.getElementById('modalPass').value,
       screen_url: url,
     });
+    log.innerHTML = '';
     (data.steps || []).forEach(s => appendLog(log, s, false));
     if (data.success) {
       appendLog(log, '\\n--- PROVISIONING VOLTOOID ---', false);
@@ -1181,7 +1246,7 @@ class Handler(BaseHTTPRequestHandler):
             hosts, err = _parse_subnets(body.get('subnets', ''))
             if err:
                 self._json_error(err, 400); return
-            self._json({'players': scan_players(hosts)})
+            self._json({'players': scan_players(hosts), 'mdns': MDNS_AVAILABLE})
 
         elif self.path == '/api/probe':
             err = _require_fields(body, 'ip')

@@ -5,7 +5,7 @@ Provisioning tool voor SpinetiX HMP players. Scant het lokale netwerk, configure
 ## Vereisten
 
 - Python 3.7+
-- macOS (voor mDNS discovery via `dns-sd`)
+- macOS of Windows. mDNS discovery via `dns-sd` werkt op macOS en op Windows met Bonjour; zonder `dns-sd` valt de tool terug op de ARP-tabel en vul je je eigen subnet in bij "Extra subnets"
 - Geen externe dependencies (alleen Python stdlib)
 
 ## Gebruik
@@ -22,7 +22,7 @@ Opent automatisch `http://localhost:8090` in de browser.
 1. **Scan netwerk** - vindt SpinetiX players via mDNS (eigen VLAN) en optioneel via subnet-scan (andere VLAN's)
 2. **Configureren** - klik op een player, voer credentials + screen URL in
 3. **Test verbinding** - controleert auth, toont firmware/licentie/temperatuur
-4. **Provision + Push** - eenmalige setup (~90 seconden):
+4. **Provision + Push** - eenmalige setup (1 tot 5 minuten, afhankelijk van de herstart):
    - Schakelt ARYA cloud uit (`<disable-cloud/>`)
    - Herstart player
    - Pusht bridge SVG met content iframe + RDM polling script
@@ -35,6 +35,12 @@ mDNS (Bonjour) en ARP werken alleen binnen het eigen VLAN; routers sturen die mu
 - **Player toevoegen via IP-adres**: voor als je het adres al weet. Een host die niet als SpinetiX herkend wordt, komt in de lijst met label "Onbekend"; controleer dan met "Test verbinding".
 
 De gebruiker moet vanaf zijn VLAN via routing/firewall bij poort 443 en 9802 van de players kunnen.
+
+### Timeout na herstart
+Na de herstart probeert de tool tot 5 minuten lang de player te bereiken en toont de laatste fout (timeout, verbinding geweigerd, 401). Komt de player niet terug, dan is de cloud al uitgeschakeld: gebruik **Alleen content pushen** zodra de player bereikbaar is. Controleer bij een timeout of de player na de herstart via DHCP een ander IP-adres heeft gekregen.
+
+### Herkenning bij subnet-scan / handmatig
+Zonder credentials herkent de tool een SpinetiX aan: reverse DNS (`spx-hmp-...`), het TLS-certificaat, de Server-header, de auth-realm of de loginpagina.
 
 ### URL wijzigen (Alleen content pushen)
 Voor al-geprovisioned players: direct een nieuwe screen URL pushen zonder reboot.
