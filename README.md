@@ -19,7 +19,7 @@ Opent automatisch `http://localhost:8090` in de browser.
 ## Flow
 
 ### Eerste keer per player (Provision + Push)
-1. **Scan netwerk** - vindt SpinetiX players via mDNS
+1. **Scan netwerk** - vindt SpinetiX players via mDNS (eigen VLAN) en optioneel via subnet-scan (andere VLAN's)
 2. **Configureren** - klik op een player, voer credentials + screen URL in
 3. **Test verbinding** - controleert auth, toont firmware/licentie/temperatuur
 4. **Provision + Push** - eenmalige setup (~90 seconden):
@@ -27,6 +27,14 @@ Opent automatisch `http://localhost:8090` in de browser.
    - Herstart player
    - Pusht bridge SVG met content iframe + RDM polling script
    - Toont claim code (authHash) voor koppeling in DST Connect CMS
+
+### Players in andere VLAN's
+mDNS (Bonjour) en ARP werken alleen binnen het eigen VLAN; routers sturen die multicast niet door. Voor players in andere VLAN's:
+
+- **Extra subnets**: vul IP-ranges in, bijvoorbeeld `10.20.0.0/24, 10.30.0.0/24` of `192.168.5.10-50` (max 4096 adressen, alleen privé-ranges). De tool zoekt per adres naar poort 443 en herkent een SpinetiX aan hostname (`spx-hmp-...`), Server-header, auth-realm of loginpagina. Er worden hierbij geen credentials naar onbekende hosts gestuurd.
+- **Player toevoegen via IP-adres**: voor als je het adres al weet. Een host die niet als SpinetiX herkend wordt, komt in de lijst met label "Onbekend"; controleer dan met "Test verbinding".
+
+De gebruiker moet vanaf zijn VLAN via routing/firewall bij poort 443 en 9802 van de players kunnen.
 
 ### URL wijzigen (Alleen content pushen)
 Voor al-geprovisioned players: direct een nieuwe screen URL pushen zonder reboot.

@@ -15,6 +15,7 @@ import time
 import ssl
 import base64
 import ipaddress
+import socket
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,10 @@ from xml.sax.saxutils import escape as xml_escape
 PORT = 8090
 BIND_HOST = '127.0.0.1'  # localhost only, not exposed to network
 SCAN_TIMEOUT = 6  # seconds for mDNS browse
+MAX_SCAN_HOSTS = 4096  # max IPs per subnet scan (a /20)
+SCAN_WORKERS = 128  # parallel probes during subnet scan
+PROBE_CONNECT_TIMEOUT = 0.8  # seconds for TCP connect to port 443
+PROBE_HTTP_TIMEOUT = 4  # seconds for identification request
 REBOOT_WAIT = 60  # seconds to wait after reboot
 MAX_REQUEST_SIZE = 1024 * 1024  # 1MB max request body
 ALLOWED_ORIGIN = f'http://localhost:{PORT}'
@@ -56,6 +61,10 @@ def _validate_ip(ip):
         return False
     if addr.is_loopback or addr == ipaddress.ip_address('169.254.169.254'):
         return False
+    # 0.0.0.0/8 counts as "private" in older Python but connects to localhost
+    if (addr.is_unspecified or addr.is_multicast or addr.is_reserved
+            or (addr.version == 4 and addr in ipaddress.ip_network('0.0.0.0/8'))):
+        return False
     if addr.is_private or addr.is_link_local:
         return True
     return False
@@ -85,9 +94,33 @@ def _require_fields(body, *fields):
 _discovered_ips = set()  # track discovered player IPs for SSRF validation
 
 
-def scan_players():
-    """Discover SpinetiX players via mDNS (dns-sd on macOS)."""
+def scan_players(hosts=None):
+    """Discover players: mDNS in the own VLAN plus optional unicast probe of
+    extra IP ranges (other VLANs). Results are merged and deduplicated by IP."""
     global _discovered_ips
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        mdns_future = pool.submit(_scan_mdns)
+        subnet_future = pool.submit(scan_subnets, hosts or [])
+        mdns_players = mdns_future.result()
+        subnet_players = subnet_future.result()
+
+    merged = {}
+    for p in mdns_players:
+        p['source'] = 'mDNS'
+        merged[p['ip']] = p
+    for p in subnet_players:
+        if p['ip'] in merged:
+            continue
+        p['source'] = 'Subnet'
+        merged[p['ip']] = p
+
+    players = sorted(merged.values(), key=lambda p: ipaddress.ip_address(p['ip']))
+    _discovered_ips = {p['ip'] for p in players}
+    return players
+
+
+def _scan_mdns():
+    """Discover SpinetiX players via mDNS (dns-sd on macOS). Own VLAN only."""
     instances = []
     try:
         proc = subprocess.Popen(
@@ -108,9 +141,7 @@ def scan_players():
                 if len(parts) >= 7:
                     instances.append(' '.join(parts[6:]))
     except FileNotFoundError:
-        players = _scan_arp_fallback()
-        _discovered_ips = {p['ip'] for p in players}
-        return players
+        return _scan_arp_fallback()
     except Exception as e:
         print(f"Scan error: {e}")
         return []
@@ -119,9 +150,7 @@ def scan_players():
     with ThreadPoolExecutor(max_workers=8) as pool:
         players = list(pool.map(_resolve_player, instances))
 
-    players = [p for p in players if p is not None]
-    _discovered_ips = {p['ip'] for p in players}
-    return players
+    return [p for p in players if p is not None]
 
 
 def _resolve_player(instance_name):
@@ -214,6 +243,150 @@ def _scan_arp_fallback():
     except Exception as e:
         print(f"ARP fallback error: {e}")
     return players
+
+
+# ─── Subnet Scan (cross-VLAN) ────────────────────────────────────────────────
+# mDNS and ARP only work inside the own broadcast domain (VLAN). Players in
+# other VLANs are found by probing a routed IP range over unicast HTTPS.
+
+def _parse_subnets(text):
+    """Parse comma/space/newline separated IPs, CIDRs or ranges (a.b.c.d-e).
+    Returns (list of host IP strings, error string or None)."""
+    hosts = []
+    for token in re.split(r'[\s,;]+', (text or '').strip()):
+        if not token:
+            continue
+        try:
+            if '-' in token:
+                start_s, end_s = token.split('-', 1)
+                start = ipaddress.ip_address(start_s)
+                if '.' not in end_s:  # short form 10.0.0.10-50
+                    end_s = start_s.rsplit('.', 1)[0] + '.' + end_s
+                end = ipaddress.ip_address(end_s)
+                if start.version != 4 or end.version != 4 or end < start:
+                    return [], f'Ongeldige range: {token}'
+                if not (start.is_private and end.is_private):
+                    return [], f'Alleen privé-adressen toegestaan: {token}'
+                if int(end) - int(start) + 1 > MAX_SCAN_HOSTS:
+                    return [], f'Range te groot: {token}'
+                hosts.extend(str(ipaddress.ip_address(i)) for i in range(int(start), int(end) + 1))
+            else:
+                net = ipaddress.ip_network(token, strict=False)
+                if net.version != 4:
+                    return [], f'Alleen IPv4 ondersteund: {token}'
+                if not net.is_private:
+                    return [], f'Alleen privé-adressen toegestaan: {token}'
+                if net.num_addresses > MAX_SCAN_HOSTS:
+                    return [], f'Subnet te groot (max /{32 - (MAX_SCAN_HOSTS.bit_length() - 1)}): {token}'
+                hosts.extend(str(h) for h in (net.hosts() if net.num_addresses > 2 else net))
+        except ValueError:
+            return [], f'Ongeldig subnet: {token}'
+        if len(hosts) > MAX_SCAN_HOSTS:
+            return [], f'Te veel adressen in totaal (max {MAX_SCAN_HOSTS})'
+    # dedupe, keep order, drop loopback/metadata
+    seen = set()
+    result = []
+    for h in hosts:
+        if h not in seen and _validate_ip(h):
+            seen.add(h)
+            result.append(h)
+    return result, None
+
+
+def _port_open(ip, port, timeout=PROBE_CONNECT_TIMEOUT):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _mac_from_hostname(hostname):
+    """SpinetiX hostnames look like spx-hmp-001d50222782."""
+    m = re.search(r'spx-hmp-([0-9a-fA-F]{12})', hostname or '')
+    if not m:
+        return ''
+    raw = m.group(1)
+    return ':'.join(raw[i:i+2] for i in range(0, 12, 2)).upper()
+
+
+def _identify_player(ip):
+    """Check whether a host with an open HTTPS port is a SpinetiX player.
+    Uses unauthenticated signals only (no credentials are sent to unknown hosts):
+    reverse DNS name, Server header, auth realm and the login page body.
+    Returns (is_spinetix, info dict)."""
+    info = {'ip': ip, 'model': 'HMP', 'serial': '', 'mac': '', 'hostname': ''}
+    signals = []
+
+    try:
+        hostname = socket.gethostbyaddr(ip)[0]
+        info['hostname'] = hostname
+        if 'spx-hmp' in hostname.lower():
+            signals.append('dns')
+            info['mac'] = _mac_from_hostname(hostname)
+    except (OSError, UnicodeError):
+        pass
+
+    for path in ('/status/info', '/'):
+        try:
+            req = urllib.request.Request(f'https://{ip}{path}')
+            resp = urllib.request.urlopen(req, context=_player_ssl_context(), timeout=PROBE_HTTP_TIMEOUT)
+            headers, body = resp.headers, resp.read(65536).decode('utf-8', 'replace')
+        except urllib.error.HTTPError as e:
+            headers = e.headers
+            try:
+                body = e.read(65536).decode('utf-8', 'replace')
+            except Exception:
+                body = ''
+        except Exception:
+            continue
+
+        haystack = ' '.join([
+            headers.get('Server', '') if headers else '',
+            headers.get('WWW-Authenticate', '') if headers else '',
+            body,
+        ]).lower()
+        if 'spinetix' in haystack or re.search(r'\bhmp\s?\d{3}', haystack):
+            signals.append(path)
+            # /status/info may be readable without auth on some configurations
+            for tag, key in (('serial', 'serial'), ('ethmac', 'mac')):
+                m = re.search(f'<{tag}>(.*?)</{tag}>', body)
+                if m:
+                    info[key] = m.group(1).strip().upper() if key == 'mac' else m.group(1).strip()
+            m = re.search(r'\b(HMP\s?\d{3})\b', body, re.IGNORECASE)
+            if m and info['model'] == 'HMP':
+                info['model'] = m.group(1).upper().replace(' ', '')
+            break
+
+    return bool(signals), info
+
+
+def _probe_host(ip):
+    """Return player dict if ip is a SpinetiX player, else None."""
+    if not _port_open(ip, 443):
+        return None
+    ok, info = _identify_player(ip)
+    return info if ok else None
+
+
+def scan_subnets(hosts):
+    """Probe a list of IPs in parallel for SpinetiX players."""
+    if not hosts:
+        return []
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        results = list(pool.map(_probe_host, hosts))
+    return [r for r in results if r]
+
+
+def probe_manual(ip):
+    """Manually added IP: accept any host with HTTPS reachable, flag if unrecognised."""
+    if not _port_open(ip, 443, timeout=3):
+        return {'success': False, 'error': 'Geen HTTPS-verbinding met dit IP-adres (poort 443)'}
+    ok, info = _identify_player(ip)
+    info['verified'] = ok
+    if not ok:
+        info['model'] = 'Onbekend'
+    return {'success': True, 'player': info}
 
 
 # ─── Player API ──────────────────────────────────────────────────────────────
@@ -582,6 +755,14 @@ HTML_BYTES = '''<!DOCTYPE html>
   .btn-sm { padding: 6px 14px; font-size: 13px; }
 
   .scan-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .scan-options { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+  .scan-options label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; color: #555; }
+  .scan-options .hint { font-size: 12px; color: #888; margin-top: 4px; }
+  .inline { display: flex; gap: 8px; }
+  .inline input { flex: 1; }
+  @media (max-width: 700px) { .scan-options { grid-template-columns: 1fr; } }
+  .badge-src { background: #f3f4f6; color: #555; }
+  .badge-warn { background: #fef3c7; color: #b45309; }
 
   table { width: 100%; border-collapse: collapse; }
   th { text-align: left; padding: 10px 12px; font-size: 12px; text-transform: uppercase; color: #888; border-bottom: 2px solid #eee; }
@@ -628,6 +809,21 @@ HTML_BYTES = '''<!DOCTYPE html>
     <div class="scan-bar">
       <button class="btn btn-primary" onclick="scanPlayers()" id="scanBtn">Scan netwerk</button>
       <span id="scanStatus" style="font-size:13px;color:#888;"></span>
+    </div>
+    <div class="scan-options">
+      <div>
+        <label for="subnets">Extra subnets / VLAN's (optioneel)</label>
+        <input type="text" id="subnets" placeholder="10.20.0.0/24, 10.30.0.0/24, 192.168.5.10-50">
+        <p class="hint">mDNS vindt alleen players in je eigen VLAN. Vul hier de IP-ranges van andere VLAN's in (max 4096 adressen).</p>
+      </div>
+      <div>
+        <label for="manualIp">Player toevoegen via IP-adres</label>
+        <div class="inline">
+          <input type="text" id="manualIp" placeholder="10.20.0.15">
+          <button class="btn btn-primary btn-sm" onclick="addManual()" id="manualBtn">Toevoegen</button>
+        </div>
+        <p class="hint" id="manualStatus"></p>
+      </div>
     </div>
   </div>
 
@@ -694,15 +890,23 @@ function esc(s) {
   return d.innerHTML;
 }
 
+const SUBNETS_KEY = 'spx_subnets';
+try { document.getElementById('subnets').value = localStorage.getItem(SUBNETS_KEY) || ''; } catch (_) {}
+document.getElementById('manualIp').addEventListener('keydown', e => { if (e.key === 'Enter') addManual(); });
+
 async function scanPlayers() {
   const btn = document.getElementById('scanBtn');
   const status = document.getElementById('scanStatus');
+  const subnets = document.getElementById('subnets').value.trim();
+  try { localStorage.setItem(SUBNETS_KEY, subnets); } catch (_) {}
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Scannen...';
-  status.textContent = 'mDNS browse actief, even geduld...';
+  status.textContent = subnets ? 'mDNS + subnet-scan actief, dit kan tot een minuut duren...' : 'mDNS browse actief, even geduld...';
   try {
-    const data = await api('/scan');
+    const data = await api('/scan', {subnets: subnets});
+    const manual = players.filter(p => p.source === 'Handmatig');
     players = data.players || [];
+    manual.forEach(m => { if (!players.some(p => p.ip === m.ip)) players.push(m); });
     renderPlayers();
     status.textContent = players.length + ' player(s) gevonden';
   } catch (e) {
@@ -712,6 +916,33 @@ async function scanPlayers() {
   btn.textContent = 'Scan netwerk';
 }
 
+async function addManual() {
+  const input = document.getElementById('manualIp');
+  const btn = document.getElementById('manualBtn');
+  const status = document.getElementById('manualStatus');
+  const ip = input.value.trim();
+  if (!ip) return;
+  btn.disabled = true;
+  status.style.color = '#888';
+  status.textContent = 'Verbinding controleren...';
+  try {
+    const data = await api('/probe', {ip: ip});
+    if (!data.success) throw new Error(data.error || 'Niet bereikbaar');
+    const p = data.player;
+    p.source = 'Handmatig';
+    players = players.filter(x => x.ip !== p.ip);
+    players.push(p);
+    renderPlayers();
+    input.value = '';
+    status.style.color = p.verified ? '#16a34a' : '#b45309';
+    status.textContent = p.verified ? 'SpinetiX player toegevoegd.' : 'Toegevoegd, maar niet herkend als SpinetiX. Controleer via "Test verbinding".';
+  } catch (e) {
+    status.style.color = '#dc2626';
+    status.textContent = e.message;
+  }
+  btn.disabled = false;
+}
+
 function renderPlayers() {
   const el = document.getElementById('playerList');
   if (!players.length) {
@@ -719,7 +950,7 @@ function renderPlayers() {
     return;
   }
   const table = document.createElement('table');
-  table.innerHTML = '<thead><tr><th>Status</th><th>Model</th><th>Serial</th><th>IP-adres</th><th>MAC</th><th>Actie</th></tr></thead>';
+  table.innerHTML = '<thead><tr><th>Status</th><th>Model</th><th>Serial</th><th>IP-adres</th><th>MAC</th><th>Via</th><th>Actie</th></tr></thead>';
   const tbody = document.createElement('tbody');
   players.forEach((p, i) => {
     const tr = document.createElement('tr');
@@ -728,6 +959,7 @@ function renderPlayers() {
       '<td>' + esc(p.serial) + '</td>' +
       '<td><code>' + esc(p.ip) + '</code></td>' +
       '<td><code style="font-size:12px;">' + esc(p.mac) + '</code></td>' +
+      '<td><span class="badge ' + (p.verified === false ? 'badge-warn' : 'badge-src') + '">' + esc(p.source || 'mDNS') + '</span></td>' +
       '<td></td>';
     const btn = document.createElement('button');
     btn.className = 'btn btn-primary btn-sm';
@@ -946,7 +1178,22 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == '/api/scan':
-            self._json({'players': scan_players()})
+            hosts, err = _parse_subnets(body.get('subnets', ''))
+            if err:
+                self._json_error(err, 400); return
+            self._json({'players': scan_players(hosts)})
+
+        elif self.path == '/api/probe':
+            err = _require_fields(body, 'ip')
+            if err:
+                self._json_error(err, 400); return
+            ip = str(body['ip']).strip()
+            if not _validate_ip(ip):
+                self._json_error('Ongeldig IP-adres (alleen privé-adressen)', 400); return
+            result = probe_manual(ip)
+            if result.get('success'):
+                _discovered_ips.add(ip)
+            self._json(result)
 
         elif self.path == '/api/test-auth':
             err = _require_fields(body, 'ip', 'username', 'password')
