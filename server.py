@@ -378,12 +378,21 @@ def _identify_player(ip):
         except Exception:
             continue
 
+        # SpinetiX players send X-Spinetix-Firmware / X-Spinetix-Serial /
+        # X-Raperca-Version headers on every response, also without auth.
+        spx_headers = {k.lower(): v for k, v in (headers.items() if headers else [])
+                       if k.lower().startswith(('x-spinetix-', 'x-raperca-'))}
+        if spx_headers.get('x-spinetix-serial'):
+            info['serial'] = spx_headers['x-spinetix-serial'].strip()
+        if spx_headers.get('x-spinetix-firmware'):
+            info['firmware'] = spx_headers['x-spinetix-firmware'].strip()
+
         haystack = ' '.join([
             headers.get('Server', '') if headers else '',
             headers.get('WWW-Authenticate', '') if headers else '',
             body,
         ]).lower()
-        if 'spinetix' in haystack or re.search(r'\bhmp\s?\d{3}', haystack):
+        if spx_headers or 'spinetix' in haystack or re.search(r'\bhmp\s?\d{3}', haystack):
             signals.append(path)
             # /status/info may be readable without auth on some configurations
             for tag, key in (('serial', 'serial'), ('ethmac', 'mac')):
