@@ -47,7 +47,7 @@ Voor de push controleert de tool eerst poort 9802 (tot 90s na de herstart) en pr
 Testen vanaf Windows: `Test-NetConnection <ip> -Port 9802` (PowerShell).
 
 ### Herkenning bij subnet-scan / handmatig
-Zonder credentials herkent de tool een SpinetiX aan: reverse DNS (`spx-hmp-...`), het TLS-certificaat, de Server-header, de auth-realm of de loginpagina.
+Zonder credentials herkent de tool een SpinetiX aan: de `X-Spinetix-*` response-headers (firmware, serial), reverse DNS (`spx-hmp-...`), het TLS-certificaat, de Server-header, de auth-realm of de loginpagina.
 
 ### URL wijzigen (Alleen content pushen)
 Voor al-geprovisioned players: direct een nieuwe screen URL pushen zonder reboot.
