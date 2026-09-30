@@ -39,6 +39,13 @@ De gebruiker moet vanaf zijn VLAN via routing/firewall bij poort 443 en 9802 van
 ### Timeout na herstart
 Na de herstart probeert de tool tot 5 minuten lang de player te bereiken en toont de laatste fout (timeout, verbinding geweigerd, 401). Komt de player niet terug, dan is de cloud al uitgeschakeld: gebruik **Alleen content pushen** zodra de player bereikbaar is. Controleer bij een timeout of de player na de herstart via DHCP een ander IP-adres heeft gekregen.
 
+### Content push mislukt (poort 9802)
+Voor de push controleert de tool eerst poort 9802 (tot 90s na de herstart) en probeert de upload 3 keer:
+- **timeout**: pakketten worden weggegooid, meestal een firewall tussen VLAN's. Poort 443 werkt dan wel. Sta TCP 9802 toe van de beheer-pc naar de player.
+- **geweigerd**: de player draait, maar de publish-dienst niet. Controleer of de cloud uitgeschakeld is.
+
+Testen vanaf Windows: `Test-NetConnection <ip> -Port 9802` (PowerShell).
+
 ### Herkenning bij subnet-scan / handmatig
 Zonder credentials herkent de tool een SpinetiX aan: reverse DNS (`spx-hmp-...`), het TLS-certificaat, de Server-header, de auth-realm of de loginpagina.
 
