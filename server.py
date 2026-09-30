@@ -36,6 +36,9 @@ PROBE_HTTP_TIMEOUT = 4  # seconds for identification request
 REBOOT_WAIT = 30  # seconds before first check after reboot
 REBOOT_MAX_WAIT = 300  # total seconds to wait for the player to come back
 REBOOT_POLL_INTERVAL = 10  # seconds between checks after reboot
+PUBLISH_PORT = 9802  # Elementi publish port (WebDAV PUT of index.svg)
+PUBLISH_PORT_WAIT = 90  # seconds to wait for the publish port after boot
+PUSH_ATTEMPTS = 3
 MAX_REQUEST_SIZE = 1024 * 1024  # 1MB max request body
 ALLOWED_ORIGIN = f'http://localhost:{PORT}'
 
@@ -466,6 +469,63 @@ def _describe_error(e):
     return type(e).__name__
 
 
+def _port_status(ip, port, timeout=3):
+    """'open', 'refused' (host up, nothing listening) or 'timeout' (packets
+    dropped, typically a firewall between VLANs)."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return 'open'
+    except ConnectionRefusedError:
+        return 'refused'
+    except (socket.timeout, TimeoutError):
+        return 'timeout'
+    except OSError as e:
+        return f'netwerkfout: {e.strerror or e}'
+
+
+def _push_svg(ip, username, password, svg, log=print):
+    """Upload the bridge SVG to the publish port. Waits for the port to open
+    after a reboot and retries the upload. Returns (success, error message)."""
+    deadline = time.time() + PUBLISH_PORT_WAIT
+    status = _port_status(ip, PUBLISH_PORT)
+    if status != 'open':
+        log(f"Poort {PUBLISH_PORT} nog niet bereikbaar ({status}), wachten...")
+    while status != 'open' and time.time() < deadline:
+        time.sleep(5)
+        status = _port_status(ip, PUBLISH_PORT)
+    if status == 'timeout':
+        return False, (f"Poort {PUBLISH_PORT} niet bereikbaar (timeout). Poort 443 werkt wel, "
+                       f"dus waarschijnlijk blokkeert een firewall poort {PUBLISH_PORT} tussen "
+                       f"de VLAN's. Sta TCP {PUBLISH_PORT} toe naar de player.")
+    if status == 'refused':
+        return False, (f"Player weigert poort {PUBLISH_PORT}: de publish-dienst draait niet. "
+                       f"Controleer of de cloud uitgeschakeld is (Provision + Push).")
+    if status != 'open':
+        return False, f"Poort {PUBLISH_PORT} niet bereikbaar ({status})"
+
+    url = f'https://{ip}:{PUBLISH_PORT}/index.svg'
+    last_error = ''
+    for attempt in range(1, PUSH_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(url, data=svg.encode('utf-8'), method='PUT')
+            req.add_header('Content-Type', 'image/svg+xml')
+            req.add_header('Authorization', _auth_header(username, password))
+            resp = urllib.request.urlopen(req, context=_player_ssl_context(), timeout=30)
+            if resp.status in (200, 201, 204):
+                return True, ''
+            last_error = f'HTTP {resp.status}'
+        except urllib.error.HTTPError as e:
+            last_error = _describe_error(e)
+            if e.code in (401, 403):
+                break  # retrying won't help
+        except Exception as e:
+            last_error = _describe_error(e)
+        if attempt < PUSH_ATTEMPTS:
+            log(f"Push poging {attempt} mislukt ({last_error}), opnieuw proberen...")
+            time.sleep(10)
+    return False, f"Content push mislukt: {last_error}"
+
+
 def _mac_to_auth_hash(mac):
     """Generate deterministic authHash from MAC address.
     Format: spx_{mac_without_colons_lowercase}
@@ -716,18 +776,13 @@ def provision_player(ip, username, password, screen_url, mac=''):
         # Step 4: Push bridge SVG with RDM polling
         log("Bridge SVG pushen (content + RDM polling)...")
         svg = _build_svg(screen_url, auth_hash)
-
-        url = f'https://{ip}:9802/index.svg'
-        req = urllib.request.Request(url, data=svg.encode('utf-8'), method='PUT')
-        req.add_header('Content-Type', 'image/svg+xml')
-        req.add_header('Authorization', _auth_header(username, password))
-        resp = urllib.request.urlopen(req, context=_player_ssl_context(), timeout=15)
-
-        if resp.status in (200, 201, 204):
+        ok, err = _push_svg(ip, username, password, svg, log)
+        if ok:
             log("Content succesvol gepusht!")
         else:
-            log(f"Onverwachte status: {resp.status}")
-            return {'success': False, 'steps': steps, 'error': 'Content push mislukt'}
+            log(err)
+            log("Cloud is al uitgeschakeld. Na het oplossen: gebruik 'Alleen content pushen'.")
+            return {'success': False, 'steps': steps, 'auth_hash': auth_hash, 'error': 'Content push mislukt'}
 
         # Step 5: Verify with screenshot
         time.sleep(5)
@@ -762,19 +817,12 @@ def push_content_only(ip, username, password, screen_url, mac=''):
             return {'success': False, 'error': 'Kan MAC-adres niet ophalen'}
         auth_hash = _mac_to_auth_hash(mac)
         svg = _build_svg(screen_url, auth_hash)
-
-        url = f'https://{ip}:9802/index.svg'
-        req = urllib.request.Request(url, data=svg.encode('utf-8'), method='PUT')
-        req.add_header('Content-Type', 'image/svg+xml')
-        req.add_header('Authorization', _auth_header(username, password))
-        resp = urllib.request.urlopen(req, context=_player_ssl_context(), timeout=15)
-
-        if resp.status in (200, 201, 204):
+        ok, err = _push_svg(ip, username, password, svg)
+        if ok:
             return {'success': True}
-        else:
-            return {'success': False, 'error': 'Content push mislukt'}
-    except Exception:
-        return {'success': False, 'error': 'Kan niet verbinden met player'}
+        return {'success': False, 'error': err}
+    except Exception as e:
+        return {'success': False, 'error': f'Kan niet verbinden met player: {_describe_error(e)}'}
 
 
 def take_screenshot(ip, username, password):
