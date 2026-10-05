@@ -52,6 +52,9 @@ Zonder credentials herkent de tool een SpinetiX aan: de `X-Spinetix-*` response-
 ### Stand van het scherm en formaat
 In het configuratievenster kies je de stand: liggend, staand (met of tegen de klok mee) of 180 graden gedraaid. De tool zet `display-orientation` op de player (direct actief, geen herstart) en pusht de content in het juiste formaat: 1920x1080 liggend, 1080x1920 staand. Optioneel geef je een eigen breedte en hoogte op (240 tot 7680); de player schaalt dat passend op het scherm. Getest op HMP400.
 
+### Screenshots
+Boven de lijst met players vul je één keer username en wachtwoord in. Met **Screenshots van alle players** haalt de tool van elke player een screenshot op (4 tegelijk), per player kan het ook met **Screenshot** / **Vernieuwen**. Klik op een miniatuur om te vergroten. Staande players worden rechtop getoond (de tool leest de stand van de player uit). Lukt het niet, dan staat de oorzaak in de tabel (bijvoorbeeld 401 of timeout).
+
 ### URL wijzigen (Alleen content pushen)
 Voor al-geprovisioned players: direct een nieuwe screen URL pushen zonder reboot.
 
