@@ -39,6 +39,18 @@ REBOOT_POLL_INTERVAL = 10  # seconds between checks after reboot
 PUBLISH_PORT = 9802  # Elementi publish port (WebDAV PUT of index.svg)
 PUBLISH_PORT_WAIT = 90  # seconds to wait for the publish port after boot
 PUSH_ATTEMPTS = 3
+
+# Player screen orientation (<display-orientation> values, verified on HMP400
+# fw 4.9.8). Value -> (label, content is portrait)
+ORIENTATIONS = {
+    'horizontal': ('Liggend', False),
+    'rotateRight': ('Staand (met de klok mee)', True),
+    'rotateLeft': ('Staand (tegen de klok in)', True),
+    'rotate180': ('Liggend, 180 graden gedraaid', False),
+}
+DEFAULT_ORIENTATION = 'horizontal'
+MIN_CONTENT_SIZE = 240
+MAX_CONTENT_SIZE = 7680
 MAX_REQUEST_SIZE = 1024 * 1024  # 1MB max request body
 ALLOWED_ORIGIN = f'http://localhost:{PORT}'
 
@@ -548,7 +560,35 @@ DEVICE_CONFIG_PATH = '/device/config'
 DEVICE_STATUS_PATH = '/device/status'
 
 
-def _build_svg(screen_url, auth_hash):
+def _content_size(orientation, width=None, height=None):
+    """Content size for the bridge SVG. Defaults to 1920x1080, or 1080x1920
+    for portrait orientations. Custom sizes give other aspect ratios; the
+    player scales the SVG to fit the screen. Returns ((w, h), error)."""
+    if not width and not height:
+        portrait = ORIENTATIONS.get(orientation, ORIENTATIONS[DEFAULT_ORIENTATION])[1]
+        return ((1080, 1920) if portrait else (1920, 1080)), None
+    try:
+        w, h = int(width), int(height)
+    except (TypeError, ValueError):
+        return None, 'Vul zowel breedte als hoogte in (hele getallen)'
+    if not (MIN_CONTENT_SIZE <= w <= MAX_CONTENT_SIZE and MIN_CONTENT_SIZE <= h <= MAX_CONTENT_SIZE):
+        return None, f'Breedte en hoogte moeten tussen {MIN_CONTENT_SIZE} en {MAX_CONTENT_SIZE} liggen'
+    return (w, h), None
+
+
+def _set_orientation(ip, username, password, orientation):
+    """Set the player's screen orientation. Applies immediately, no reboot.
+    Returns error string or None."""
+    xml = (f'<configuration version="2.3"><display-orientation>{orientation}'
+           f'</display-orientation></configuration>')
+    result = _rpc_call(ip, 'set_config', [{'xmlconfig': xml}], username, password).get('result', {})
+    if result.get('success'):
+        return None
+    errors = '; '.join(e.get('description', '') for e in result.get('errors', []) if isinstance(e, dict))
+    return f"Stand van het scherm niet ingesteld: {errors or 'onbekende fout'}"
+
+
+def _build_svg(screen_url, auth_hash, width=1920, height=1080):
     """Build bridge SVG: iframe for content + JavaScript polling for RDM.
 
     The SVG acts as a lightweight applet replacement:
@@ -561,8 +601,8 @@ def _build_svg(screen_url, auth_hash):
 
     return f'''<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-     width="1920" height="1080" viewBox="0 0 1920 1080" dur="indefinite" viewport-fill="#000000">
-  <iframe src="{safe_url}" x="0" y="0" width="1920" height="1080"/>
+     width="{width}" height="{height}" viewBox="0 0 {width} {height}" dur="indefinite" viewport-fill="#000000">
+  <iframe src="{safe_url}" x="0" y="0" width="{width}" height="{height}"/>
   <script type="text/ecmascript"><![CDATA[
     // DST Connect Bridge - SpinetiX RDM Agent
     // This script runs inside the SVG on the SpinetiX player and provides
@@ -715,7 +755,8 @@ def test_auth(ip, username, password):
         return {'success': False, 'error': 'Kan niet verbinden met player'}
 
 
-def provision_player(ip, username, password, screen_url, mac=''):
+def provision_player(ip, username, password, screen_url, mac='',
+                     orientation=DEFAULT_ORIENTATION, size=(1920, 1080)):
     """Full provisioning: disable cloud, reboot, push bridge SVG with RDM polling."""
     steps = []
 
@@ -782,9 +823,16 @@ def provision_player(ip, username, password, screen_url, mac=''):
                 last_logged = elapsed
             time.sleep(REBOOT_POLL_INTERVAL)
 
-        # Step 4: Push bridge SVG with RDM polling
-        log("Bridge SVG pushen (content + RDM polling)...")
-        svg = _build_svg(screen_url, auth_hash)
+        # Step 4: Screen orientation (applies immediately, no reboot)
+        log(f"Stand van het scherm: {ORIENTATIONS[orientation][0]}")
+        err = _set_orientation(ip, username, password, orientation)
+        if err:
+            log(err)
+            return {'success': False, 'steps': steps, 'auth_hash': auth_hash, 'error': err}
+
+        # Step 5: Push bridge SVG with RDM polling
+        log(f"Bridge SVG pushen ({size[0]}x{size[1]}, content + RDM polling)...")
+        svg = _build_svg(screen_url, auth_hash, *size)
         ok, err = _push_svg(ip, username, password, svg, log)
         if ok:
             log("Content succesvol gepusht!")
@@ -793,7 +841,7 @@ def provision_player(ip, username, password, screen_url, mac=''):
             log("Cloud is al uitgeschakeld. Na het oplossen: gebruik 'Alleen content pushen'.")
             return {'success': False, 'steps': steps, 'auth_hash': auth_hash, 'error': 'Content push mislukt'}
 
-        # Step 5: Verify with screenshot
+        # Step 6: Verify with screenshot
         time.sleep(5)
         log("Screenshot ophalen ter verificatie...")
         try:
@@ -815,7 +863,8 @@ def provision_player(ip, username, password, screen_url, mac=''):
         return {'success': False, 'steps': steps, 'error': 'Provisioning mislukt'}
 
 
-def push_content_only(ip, username, password, screen_url, mac=''):
+def push_content_only(ip, username, password, screen_url, mac='',
+                      orientation=DEFAULT_ORIENTATION, size=(1920, 1080)):
     """Push content without disable-cloud (for already provisioned players)."""
     try:
         if not mac:
@@ -825,7 +874,10 @@ def push_content_only(ip, username, password, screen_url, mac=''):
         if not mac:
             return {'success': False, 'error': 'Kan MAC-adres niet ophalen'}
         auth_hash = _mac_to_auth_hash(mac)
-        svg = _build_svg(screen_url, auth_hash)
+        err = _set_orientation(ip, username, password, orientation)
+        if err:
+            return {'success': False, 'error': err}
+        svg = _build_svg(screen_url, auth_hash, *size)
         ok, err = _push_svg(ip, username, password, svg)
         if ok:
             return {'success': True}
@@ -895,6 +947,8 @@ HTML_BYTES = '''<!DOCTYPE html>
   .badge-kiosk { background: #dbeafe; color: #1d4ed8; }
   .badge-no { background: #fee2e2; color: #dc2626; }
 
+  .modal .hint { font-size: 12px; color: #888; margin-top: 4px; }
+  select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; width: 100%; background: white; }
   input[type="text"], input[type="password"] { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; width: 100%; }
   input[type="text"]:focus, input[type="password"]:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
 
@@ -973,6 +1027,19 @@ HTML_BYTES = '''<!DOCTYPE html>
       <div class="field">
         <label>Screen URL</label>
         <input type="text" id="modalUrl" placeholder="https://cms.dst-connect.io/screen/...">
+      </div>
+      <div class="field">
+        <label for="modalOrientation">Stand van het scherm</label>
+        <select id="modalOrientation">__ORIENTATION_OPTIONS__</select>
+      </div>
+      <div class="field">
+        <label>Eigen formaat content (optioneel)</label>
+        <div class="inline">
+          <input type="text" id="modalWidth" inputmode="numeric" placeholder="Breedte">
+          <span style="align-self:center;color:#888;">x</span>
+          <input type="text" id="modalHeight" inputmode="numeric" placeholder="Hoogte">
+        </div>
+        <p class="hint">Leeg laten = automatisch: 1920x1080 liggend, 1080x1920 staand. Een eigen formaat wordt passend geschaald op het scherm.</p>
       </div>
       <div id="authResult"></div>
       <div class="actions">
@@ -1105,6 +1172,14 @@ function openModal(ip, model, serial) {
   document.getElementById('provisionModal').classList.add('active');
 }
 
+function displayOptions() {
+  return {
+    orientation: document.getElementById('modalOrientation').value,
+    width: document.getElementById('modalWidth').value.trim(),
+    height: document.getElementById('modalHeight').value.trim(),
+  };
+}
+
 function closeModal() {
   document.getElementById('provisionModal').classList.remove('active');
 }
@@ -1184,6 +1259,7 @@ async function startProvision() {
       username: document.getElementById('modalUser').value,
       password: document.getElementById('modalPass').value,
       screen_url: url,
+      ...displayOptions(),
     });
     log.innerHTML = '';
     (data.steps || []).forEach(s => appendLog(log, s, false));
@@ -1226,6 +1302,7 @@ async function startPushOnly() {
       username: document.getElementById('modalUser').value,
       password: document.getElementById('modalPass').value,
       screen_url: url,
+      ...displayOptions(),
     });
     if (data.success) {
       appendLog(log, 'Content succesvol gepusht!', false);
@@ -1249,7 +1326,20 @@ async function startPushOnly() {
 }
 </script>
 </body>
-</html>'''.encode('utf-8')
+</html>'''.replace('__ORIENTATION_OPTIONS__', ''.join(
+    f'<option value="{key}">{label}</option>' for key, (label, _) in ORIENTATIONS.items()
+)).encode('utf-8')
+
+
+def _display_options(body):
+    """Validate orientation + optional custom size from a request body."""
+    orientation = body.get('orientation') or DEFAULT_ORIENTATION
+    if orientation not in ORIENTATIONS:
+        return None, 'Ongeldige stand van het scherm'
+    size, err = _content_size(orientation, body.get('width'), body.get('height'))
+    if err:
+        return None, err
+    return {'orientation': orientation, 'size': size}, None
 
 
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
@@ -1333,8 +1423,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_error('Ongeldig IP-adres', 400); return
             if not _validate_screen_url(body['screen_url']):
                 self._json_error('Ongeldige screen URL (moet https:// zijn)', 400); return
+            display, err = _display_options(body)
+            if err:
+                self._json_error(err, 400); return
             self._json(provision_player(
-                body['ip'], body['username'], body['password'], body['screen_url']
+                body['ip'], body['username'], body['password'], body['screen_url'], **display
             ))
 
         elif self.path == '/api/push':
@@ -1345,8 +1438,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_error('Ongeldig IP-adres', 400); return
             if not _validate_screen_url(body['screen_url']):
                 self._json_error('Ongeldige screen URL (moet https:// zijn)', 400); return
+            display, err = _display_options(body)
+            if err:
+                self._json_error(err, 400); return
             self._json(push_content_only(
-                body['ip'], body['username'], body['password'], body['screen_url']
+                body['ip'], body['username'], body['password'], body['screen_url'], **display
             ))
 
         elif self.path == '/api/screenshot':

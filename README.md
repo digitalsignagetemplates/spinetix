@@ -49,6 +49,9 @@ Testen vanaf Windows: `Test-NetConnection <ip> -Port 9802` (PowerShell).
 ### Herkenning bij subnet-scan / handmatig
 Zonder credentials herkent de tool een SpinetiX aan: de `X-Spinetix-*` response-headers (firmware, serial), reverse DNS (`spx-hmp-...`), het TLS-certificaat, de Server-header, de auth-realm of de loginpagina.
 
+### Stand van het scherm en formaat
+In het configuratievenster kies je de stand: liggend, staand (met of tegen de klok mee) of 180 graden gedraaid. De tool zet `display-orientation` op de player (direct actief, geen herstart) en pusht de content in het juiste formaat: 1920x1080 liggend, 1080x1920 staand. Optioneel geef je een eigen breedte en hoogte op (240 tot 7680); de player schaalt dat passend op het scherm. Getest op HMP400.
+
 ### URL wijzigen (Alleen content pushen)
 Voor al-geprovisioned players: direct een nieuwe screen URL pushen zonder reboot.
 
