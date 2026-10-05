@@ -893,9 +893,19 @@ def take_screenshot(ip, username, password):
         req = urllib.request.Request(url)
         req.add_header('Authorization', _auth_header(username, password))
         resp = urllib.request.urlopen(req, context=_player_ssl_context(), timeout=15)
-        return {'success': True, 'image': base64.b64encode(resp.read()).decode()}
+        image = base64.b64encode(resp.read()).decode()
+    except Exception as e:
+        return {'success': False, 'error': f'Screenshot mislukt: {_describe_error(e)}'}
+    # The snapshot is the raw panel output; report the orientation so the UI
+    # can show it upright. Not fatal if it can't be read.
+    orientation = ''
+    try:
+        xml = _rpc_call(ip, 'get_config', [], username, password).get('result', {}).get('xmlconfig', '')
+        m = re.search(r'<display-orientation>(.*?)</display-orientation>', xml)
+        orientation = m.group(1) if m else ''
     except Exception:
-        return {'success': False, 'error': 'Screenshot ophalen mislukt'}
+        pass
+    return {'success': True, 'image': image, 'orientation': orientation}
 
 
 # ─── Web UI ──────────────────────────────────────────────────────────────────
@@ -962,6 +972,17 @@ HTML_BYTES = '''<!DOCTYPE html>
 
   .log { background: #1a1a2e; color: #4ade80; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 13px; max-height: 300px; overflow-y: auto; margin-top: 12px; white-space: pre-wrap; }
 
+  .shots-bar { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 16px; }
+  .shots-bar .f { display: flex; flex-direction: column; gap: 4px; }
+  .shots-bar label { font-size: 12px; color: #555; font-weight: 500; }
+  .shots-bar input { width: 160px; }
+  .thumb { width: 128px; max-height: 128px; object-fit: contain; background: #000; border-radius: 4px; cursor: zoom-in; display: block; }
+  .shot-msg { font-size: 12px; color: #888; max-width: 160px; }
+  .shot-msg.err { color: #dc2626; }
+  .lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 200; align-items: center; justify-content: center; flex-direction: column; gap: 12px; padding: 16px; }
+  .lightbox.active { display: flex; }
+  .lightbox img { max-width: 100%; max-height: 82vh; border-radius: 6px; background: #000; }
+  .lightbox .cap { color: #ddd; font-size: 13px; }
   .screenshot { max-width: 100%; border-radius: 8px; margin-top: 12px; border: 1px solid #ddd; }
 
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
@@ -1002,10 +1023,21 @@ HTML_BYTES = '''<!DOCTYPE html>
 
   <div class="card">
     <h2>Gevonden players</h2>
+    <div class="shots-bar">
+      <div class="f"><label for="shotUser">Username</label><input type="text" id="shotUser" value="admin" autocomplete="off"></div>
+      <div class="f"><label for="shotPass">Wachtwoord</label><input type="password" id="shotPass" autocomplete="off"></div>
+      <button class="btn btn-primary btn-sm" onclick="screenshotAll()" id="shotAllBtn">Screenshots van alle players</button>
+      <span id="shotStatus" class="shot-msg" style="max-width:none;"></span>
+    </div>
     <div id="playerList">
       <div class="empty">Klik op "Scan netwerk" om te beginnen</div>
     </div>
   </div>
+</div>
+
+<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+  <img id="lightboxImg" alt="Screenshot">
+  <div class="cap" id="lightboxCap"></div>
 </div>
 
 <div class="modal-overlay" id="provisionModal">
@@ -1062,6 +1094,7 @@ HTML_BYTES = '''<!DOCTYPE html>
 <script>
 let players = [];
 let currentIp = '';
+const shots = {};  // ip -> {image, time} or {error} or {loading}; kept across rescans
 
 async function api(path, body) {
   const opts = {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})};
@@ -1137,7 +1170,7 @@ function renderPlayers() {
     return;
   }
   const table = document.createElement('table');
-  table.innerHTML = '<thead><tr><th>Status</th><th>Model</th><th>Serial</th><th>IP-adres</th><th>MAC</th><th>Via</th><th>Actie</th></tr></thead>';
+  table.innerHTML = '<thead><tr><th>Status</th><th>Model</th><th>Serial</th><th>IP-adres</th><th>MAC</th><th>Via</th><th>Screenshot</th><th>Actie</th></tr></thead>';
   const tbody = document.createElement('tbody');
   players.forEach((p, i) => {
     const tr = document.createElement('tr');
@@ -1147,7 +1180,9 @@ function renderPlayers() {
       '<td><code>' + esc(p.ip) + '</code></td>' +
       '<td><code style="font-size:12px;">' + esc(p.mac) + '</code></td>' +
       '<td><span class="badge ' + (p.verified === false ? 'badge-warn' : 'badge-src') + '">' + esc(p.source || 'mDNS') + '</span></td>' +
+      '<td class="shot-cell"></td>' +
       '<td></td>';
+    tr.querySelector('.shot-cell').appendChild(renderShotCell(p));
     const btn = document.createElement('button');
     btn.className = 'btn btn-primary btn-sm';
     btn.textContent = 'Configureren';
@@ -1160,8 +1195,136 @@ function renderPlayers() {
   el.appendChild(table);
 }
 
+function shotCreds() {
+  return {
+    username: document.getElementById('shotUser').value.trim(),
+    password: document.getElementById('shotPass').value,
+  };
+}
+
+function renderShotCell(p) {
+  const wrap = document.createElement('div');
+  const s = shots[p.ip];
+  if (s && s.loading) {
+    wrap.innerHTML = '<span class="shot-msg">Ophalen...</span>';
+  } else if (s && s.image) {
+    const img = document.createElement('img');
+    img.className = 'thumb';
+    img.src = 'data:image/jpeg;base64,' + s.image;
+    img.title = 'Klik om te vergroten';
+    img.addEventListener('click', () => openLightbox(p));
+    wrap.appendChild(img);
+    const t = document.createElement('div');
+    t.className = 'shot-msg';
+    t.textContent = s.time;
+    wrap.appendChild(t);
+  } else if (s && s.error) {
+    const m = document.createElement('div');
+    m.className = 'shot-msg err';
+    m.textContent = s.error;
+    wrap.appendChild(m);
+  }
+  if (!s || !s.loading) {
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-sm';
+    btn.style.marginTop = '4px';
+    btn.textContent = s && s.image ? 'Vernieuwen' : 'Screenshot';
+    btn.addEventListener('click', () => takeShot(p));
+    wrap.appendChild(btn);
+  }
+  return wrap;
+}
+
+// Snapshot shows the panel as mounted; rotate so the content reads upright.
+const ROTATE_DEG = {rotateRight: 90, rotateLeft: 270, rotate180: 180};
+
+function uprightImage(b64, orientation) {
+  const deg = ROTATE_DEG[orientation];
+  if (!deg) return Promise.resolve(b64);
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      const swap = deg !== 180;
+      c.width = swap ? img.height : img.width;
+      c.height = swap ? img.width : img.height;
+      const ctx = c.getContext('2d');
+      ctx.translate(c.width / 2, c.height / 2);
+      ctx.rotate(deg * Math.PI / 180);
+      ctx.drawImage(img, -img.width / 2, -img.height / 2);
+      resolve(c.toDataURL('image/jpeg', 0.9).split(',')[1]);
+    };
+    img.onerror = () => resolve(b64);
+    img.src = 'data:image/jpeg;base64,' + b64;
+  });
+}
+
+async function takeShot(p) {
+  const creds = shotCreds();
+  if (!creds.password) {
+    shots[p.ip] = {error: 'Vul eerst het wachtwoord in boven de tabel'};
+    renderPlayers();
+    return false;
+  }
+  shots[p.ip] = {loading: true};
+  renderPlayers();
+  let ok = false;
+  try {
+    const data = await api('/screenshot', {ip: p.ip, ...creds});
+    if (data.success) {
+      shots[p.ip] = {image: await uprightImage(data.image, data.orientation), time: new Date().toLocaleTimeString('nl-NL')};
+      ok = true;
+    } else {
+      shots[p.ip] = {error: data.error || 'Screenshot mislukt'};
+    }
+  } catch (e) {
+    shots[p.ip] = {error: e.message};
+  }
+  renderPlayers();
+  return ok;
+}
+
+async function screenshotAll() {
+  const btn = document.getElementById('shotAllBtn');
+  const status = document.getElementById('shotStatus');
+  if (!players.length) { status.textContent = 'Nog geen players, scan eerst het netwerk.'; return; }
+  if (!shotCreds().password) { status.textContent = 'Vul eerst het wachtwoord in.'; return; }
+  btn.disabled = true;
+  const queue = players.slice();
+  let done = 0, okCount = 0;
+  status.textContent = 'Bezig: 0 van ' + queue.length;
+  const worker = async () => {
+    while (queue.length) {
+      const p = queue.shift();
+      if (await takeShot(p)) okCount++;
+      done++;
+      status.textContent = 'Bezig: ' + done + ' van ' + players.length;
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  status.textContent = okCount + ' van ' + done + ' screenshots opgehaald' + (okCount < done ? ' (zie meldingen in de tabel)' : '');
+  btn.disabled = false;
+}
+
+function openLightbox(p) {
+  const s = shots[p.ip];
+  if (!s || !s.image) return;
+  document.getElementById('lightboxImg').src = 'data:image/jpeg;base64,' + s.image;
+  document.getElementById('lightboxCap').textContent = (p.model || '') + ' ' + (p.serial || '') + ' (' + p.ip + ') om ' + s.time + '. Klik om te sluiten.';
+  document.getElementById('lightbox').classList.add('active');
+}
+
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('active');
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
 function openModal(ip, model, serial) {
   currentIp = ip;
+  const creds = shotCreds();
+  if (creds.username) document.getElementById('modalUser').value = creds.username;
+  if (creds.password && !document.getElementById('modalPass').value) document.getElementById('modalPass').value = creds.password;
   document.getElementById('modalPlayer').value = model + ' - ' + serial + ' (' + ip + ')';
   document.getElementById('modalTitle').textContent = model + ' ' + serial + ' configureren';
   document.getElementById('authResult').innerHTML = '';
