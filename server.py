@@ -1292,11 +1292,19 @@ HTML_BYTES = '''<!DOCTYPE html>
 
   .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100; align-items: center; justify-content: center; }
   .modal-overlay.active { display: flex; }
-  .modal { background: white; border-radius: 12px; padding: 28px; width: 520px; max-width: 95vw; max-height: 90vh; overflow-y: auto; }
+  .modal { background: white; border-radius: 12px; padding: 28px; width: 720px; max-width: 95vw; max-height: 92vh; overflow-y: auto; }
   .modal h3 { font-size: 18px; margin-bottom: 16px; }
   .modal .field { margin-bottom: 14px; }
   .modal label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; color: #555; }
-  .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+  .modal .actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-start; margin-top: 16px; }
+  .section { border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .section > .section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; margin: -4px 0 12px; }
+  .section .field:last-child { margin-bottom: 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .btn-row + .btn-row { margin-top: 10px; }
+  .row-label { width: 100%; font-size: 12px; color: #6b7280; margin-bottom: 2px; }
+  @media (max-width: 560px) { .grid2 { grid-template-columns: 1fr; } }
 
   .log { background: #1a1a2e; color: #4ade80; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 13px; max-height: 300px; overflow-y: auto; margin-top: 12px; white-space: pre-wrap; }
 
@@ -1374,59 +1382,84 @@ HTML_BYTES = '''<!DOCTYPE html>
   <div class="modal">
     <h3 id="modalTitle">Player configureren</h3>
     <div id="modalStep1">
-      <div class="field">
-        <label>Player</label>
-        <input type="text" id="modalPlayer" readonly style="background:#f5f5f5;">
+      <div class="section">
+        <div class="section-title">Verbinding</div>
+        <div class="field">
+          <label>Player</label>
+          <input type="text" id="modalPlayer" readonly style="background:#f5f5f5;">
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label>Username</label>
+            <input type="text" id="modalUser" value="admin">
+          </div>
+          <div class="field">
+            <label>Wachtwoord</label>
+            <input type="password" id="modalPass" value="">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-warning" onclick="testConnection()" id="testBtn">Test verbinding</button>
+        </div>
+        <div id="authResult"></div>
       </div>
-      <div class="field">
-        <label>Username</label>
-        <input type="text" id="modalUser" value="admin">
-      </div>
-      <div class="field">
-        <label>Wachtwoord</label>
-        <input type="password" id="modalPass" value="">
-      </div>
-      <div class="field">
-        <label>Screen URL</label>
-        <input type="text" id="modalUrl" placeholder="https://cms.dst-connect.io/screen/...">
-      </div>
-      <div class="field">
-        <label for="modalOrientation">Stand van het scherm</label>
-        <select id="modalOrientation">__ORIENTATION_OPTIONS__</select>
-      </div>
-      <div class="field">
-        <label>Eigen formaat content (optioneel)</label>
-        <div class="inline">
-          <input type="text" id="modalWidth" inputmode="numeric" placeholder="Breedte">
-          <span style="align-self:center;color:#888;">x</span>
-          <input type="text" id="modalHeight" inputmode="numeric" placeholder="Hoogte">
+
+      <div class="section">
+        <div class="section-title">Content</div>
+        <div class="field">
+          <label>Screen URL</label>
+          <input type="text" id="modalUrl" placeholder="https://cms.dst-connect.io/screen/...">
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label for="modalOrientation">Stand van het scherm</label>
+            <select id="modalOrientation">__ORIENTATION_OPTIONS__</select>
+          </div>
+          <div class="field">
+            <label>Eigen formaat content (optioneel)</label>
+            <div class="inline">
+              <input type="text" id="modalWidth" inputmode="numeric" placeholder="Breedte">
+              <span style="align-self:center;color:#888;">x</span>
+              <input type="text" id="modalHeight" inputmode="numeric" placeholder="Hoogte">
+            </div>
+          </div>
         </div>
         <p class="hint">Leeg laten = automatisch: 1920x1080 liggend, 1080x1920 staand. Een eigen formaat wordt passend geschaald op het scherm.</p>
       </div>
-      <div class="field">
-        <label>Uitvoerresolutie van de player (HDMI/DP-signaal)</label>
-        <div class="inline">
-          <input type="text" id="outW" inputmode="numeric" placeholder="Breedte" style="max-width:110px;">
-          <span style="align-self:center;color:#888;">x</span>
-          <input type="text" id="outH" inputmode="numeric" placeholder="Hoogte" style="max-width:110px;">
-          <span style="align-self:center;color:#888;">@</span>
-          <input type="text" id="outR" inputmode="numeric" placeholder="Hz" value="60" style="max-width:70px;">
+
+      <div class="section">
+        <div class="section-title">Uitvoerresolutie van de player (HDMI/DP)</div>
+        <div class="btn-row">
+          <input type="text" id="outW" inputmode="numeric" placeholder="Breedte" style="width:90px;">
+          <span style="color:#888;">x</span>
+          <input type="text" id="outH" inputmode="numeric" placeholder="Hoogte" style="width:90px;">
+          <span style="color:#888;">@</span>
+          <input type="text" id="outR" inputmode="numeric" placeholder="Hz" value="60" style="width:60px;">
           <button class="btn btn-warning btn-sm" onclick="applyDisplayMode(false)" id="resBtn" disabled>Resolutie toepassen</button>
           <button class="btn btn-sm" onclick="applyDisplayMode(true)" id="resAutoBtn" disabled>Auto</button>
         </div>
         <p class="hint">Handmatig in pixels, bijv. 4K-player naar Full HD: 1920 x 1080 @ 60. De player <strong>herstart</strong> om de mode toe te passen. Let op: op HMP400/iBX vereist dit de SYSTEMS-licentie.</p>
       </div>
-      <div id="authResult"></div>
-      <div class="actions">
-        <button class="btn" onclick="closeModal()">Annuleren</button>
-        <button class="btn btn-warning" onclick="testConnection()" id="testBtn">Test verbinding</button>
-        <button class="btn btn-success" onclick="startProvision()" id="provisionBtn" disabled>Provision + Push</button>
-        <button class="btn btn-primary" onclick="startPushOnly()" id="pushOnlyBtn" disabled>Alleen content pushen</button>
-        <button class="btn btn-primary" onclick="fetchDiagnostics()" id="diagBtn" disabled>Diagnose / logs</button>
-        <button class="btn btn-primary" onclick="modalScreenshot()" id="shotBtn" disabled>Screenshot</button>
-        <button class="btn btn-warning" onclick="startFirmware()" id="fwBtn" disabled>Firmware bijwerken</button>
+
+      <div class="section">
+        <div class="section-title">Acties</div>
+        <div class="btn-row">
+          <span class="row-label">Uitrollen</span>
+          <button class="btn btn-success" onclick="startProvision()" id="provisionBtn" disabled>Provision + Push</button>
+          <button class="btn btn-primary" onclick="startPushOnly()" id="pushOnlyBtn" disabled>Alleen content pushen</button>
+        </div>
+        <div class="btn-row">
+          <span class="row-label">Hulpmiddelen</span>
+          <button class="btn btn-primary" onclick="fetchDiagnostics()" id="diagBtn" disabled>Diagnose / logs</button>
+          <button class="btn btn-primary" onclick="modalScreenshot()" id="shotBtn" disabled>Screenshot</button>
+          <button class="btn btn-warning" onclick="startFirmware()" id="fwBtn" disabled>Firmware bijwerken</button>
+        </div>
       </div>
+
       <div id="diagResult"></div>
+      <div class="actions">
+        <button class="btn" onclick="closeModal()">Sluiten</button>
+      </div>
     </div>
     <div id="modalStep2" style="display:none;">
       <div class="log" id="provisionLog"></div>
