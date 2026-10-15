@@ -610,6 +610,38 @@ def _set_orientation(ip, username, password, orientation):
     return f"Stand van het scherm niet ingesteld: {errors or 'onbekende fout'}"
 
 
+def set_display_mode(ip, username, password, width=0, height=0, refresh=60, auto=False):
+    """Set the player's HDMI/DP output video mode via <display-video-mode>.
+    Standard notation is WxH@refresh (e.g. 1920x1080@60). A reboot is applied so
+    the mode takes effect. Pass auto=True to revert to the preferred mode.
+
+    Note: on HMP400/iBX the advanced display config needs the SYSTEMS feature;
+    without it the player returns a config error, which is surfaced as-is."""
+    if auto:
+        mode = 'auto'
+    else:
+        try:
+            w, h, r = int(width), int(height), int(refresh or 60)
+        except (TypeError, ValueError):
+            return {'success': False, 'error': 'Breedte/hoogte/refresh moeten gehele getallen zijn'}
+        if not (MIN_CONTENT_SIZE <= w <= MAX_CONTENT_SIZE and MIN_CONTENT_SIZE <= h <= MAX_CONTENT_SIZE):
+            return {'success': False, 'error': f'Resolutie buiten bereik ({MIN_CONTENT_SIZE}-{MAX_CONTENT_SIZE} px)'}
+        if not (1 <= r <= 240):
+            return {'success': False, 'error': 'Ongeldige refresh (1-240 Hz)'}
+        mode = f'{w}x{h}@{r}'
+
+    xml = (f'<configuration version="2.3"><display-video-mode>{xml_escape(mode)}'
+           f'</display-video-mode><reboot/></configuration>')
+    try:
+        result = _rpc_call(ip, 'set_config', [{'xmlconfig': xml}], username, password, timeout=20).get('result', {})
+    except Exception as e:
+        return {'success': False, 'error': f'Kan niet verbinden met player: {_describe_error(e)}'}
+    if result.get('success') or result.get('reboot_pending'):
+        return {'success': True, 'mode': mode, 'reboot': True}
+    errors = '; '.join(e.get('description', '') for e in result.get('errors', []) if isinstance(e, dict))
+    return {'success': False, 'error': errors or 'Resolutie niet ingesteld (mogelijk SYSTEMS-licentie vereist)'}
+
+
 def _build_svg(screen_url, auth_hash, width=1920, height=1080):
     """Build bridge SVG: iframe for content + JavaScript polling for RDM.
 
@@ -872,11 +904,35 @@ def test_auth(ip, username, password):
         features = re.findall(r'<features>\s*<name>(.*?)</name>.*?<valid>(.*?)</valid>', body, re.DOTALL)
         info['features'] = [f[0] for f in features if f[1] == '1' and not f[0].startswith('#')]
 
-        # Extract resolution
+        # Extract resolution (render/output resolution)
         w = re.search(r'<resolutionWidth>(.*?)</resolutionWidth>', body)
         h = re.search(r'<resolutionHeight>(.*?)</resolutionHeight>', body)
         if w and h and w.group(1) != 'unknown':
             info['resolution'] = f"{w.group(1)}x{h.group(1)}"
+
+        # Extra display metrics (refresh, colorspace, output type, orientation)
+        rfr = re.search(r'<verticalRefresh>(.*?)</verticalRefresh>', body) \
+            or re.search(r'<display>.*?<refresh>(.*?)</refresh>', body, re.DOTALL)
+        if rfr:
+            info['refresh'] = rfr.group(1)
+        cs = re.search(r'<colorspace>(.*?)</colorspace>', body)
+        if cs:
+            info['colorspace'] = cs.group(1)
+        dt = re.search(r'<display>.*?<type>(.*?)</type>', body, re.DOTALL)
+        if dt:
+            info['outputType'] = dt.group(1)
+        orient = re.search(r'<orientation>(.*?)</orientation>', body)
+        if orient:
+            info['orientation'] = orient.group(1)
+
+        # Current configured video mode (auto when the tag is unset)
+        try:
+            cfg = _rpc_call(ip, 'get_config', [], username, password, timeout=8)
+            xml = cfg.get('result', {}).get('xmlconfig', '')
+            vm = re.search(r'<display-video-mode>(.*?)</display-video-mode>', xml)
+            info['videoMode'] = vm.group(1) if vm else 'auto'
+        except Exception:
+            pass
 
         return {'success': True, 'info': info}
     except urllib.error.HTTPError as e:
@@ -1347,6 +1403,19 @@ HTML_BYTES = '''<!DOCTYPE html>
         </div>
         <p class="hint">Leeg laten = automatisch: 1920x1080 liggend, 1080x1920 staand. Een eigen formaat wordt passend geschaald op het scherm.</p>
       </div>
+      <div class="field">
+        <label>Uitvoerresolutie van de player (HDMI/DP-signaal)</label>
+        <div class="inline">
+          <input type="text" id="outW" inputmode="numeric" placeholder="Breedte" style="max-width:110px;">
+          <span style="align-self:center;color:#888;">x</span>
+          <input type="text" id="outH" inputmode="numeric" placeholder="Hoogte" style="max-width:110px;">
+          <span style="align-self:center;color:#888;">@</span>
+          <input type="text" id="outR" inputmode="numeric" placeholder="Hz" value="60" style="max-width:70px;">
+          <button class="btn btn-warning btn-sm" onclick="applyDisplayMode(false)" id="resBtn" disabled>Resolutie toepassen</button>
+          <button class="btn btn-sm" onclick="applyDisplayMode(true)" id="resAutoBtn" disabled>Auto</button>
+        </div>
+        <p class="hint">Handmatig in pixels, bijv. 4K-player naar Full HD: 1920 x 1080 @ 60. De player <strong>herstart</strong> om de mode toe te passen. Let op: op HMP400/iBX vereist dit de SYSTEMS-licentie.</p>
+      </div>
       <div id="authResult"></div>
       <div class="actions">
         <button class="btn" onclick="closeModal()">Annuleren</button>
@@ -1354,6 +1423,7 @@ HTML_BYTES = '''<!DOCTYPE html>
         <button class="btn btn-success" onclick="startProvision()" id="provisionBtn" disabled>Provision + Push</button>
         <button class="btn btn-primary" onclick="startPushOnly()" id="pushOnlyBtn" disabled>Alleen content pushen</button>
         <button class="btn btn-primary" onclick="fetchDiagnostics()" id="diagBtn" disabled>Diagnose / logs</button>
+        <button class="btn btn-primary" onclick="modalScreenshot()" id="shotBtn" disabled>Screenshot</button>
         <button class="btn btn-warning" onclick="startFirmware()" id="fwBtn" disabled>Firmware bijwerken</button>
       </div>
       <div id="diagResult"></div>
@@ -1638,6 +1708,12 @@ function openModal(ip, model, serial) {
   document.getElementById('pushOnlyBtn').disabled = true;
   document.getElementById('diagBtn').disabled = true;
   document.getElementById('fwBtn').disabled = true;
+  document.getElementById('shotBtn').disabled = true;
+  document.getElementById('resBtn').disabled = true;
+  document.getElementById('resAutoBtn').disabled = true;
+  document.getElementById('outW').value = '';
+  document.getElementById('outH').value = '';
+  document.getElementById('outR').value = '60';
   document.getElementById('diagResult').innerHTML = '';
   document.getElementById('provisionModal').classList.add('active');
 }
@@ -1683,6 +1759,57 @@ async function fetchDiagnostics() {
     out.innerHTML = '<div style="margin-top:12px;color:#dc2626;">' + esc(e.message) + '</div>';
   }
   btn.disabled = false; btn.textContent = 'Diagnose / logs';
+}
+
+async function modalScreenshot() {
+  const btn = document.getElementById('shotBtn');
+  const out = document.getElementById('diagResult');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Ophalen...';
+  out.innerHTML = '';
+  try {
+    const data = await api('/screenshot', modalCreds());
+    if (data.success) {
+      out.innerHTML = '<p style="font-size:13px;color:#888;margin-top:12px;">Live screenshot:</p>';
+      const img = document.createElement('img');
+      img.className = 'screenshot';
+      img.src = 'data:image/jpeg;base64,' + data.image;
+      if (data.orientation === 'rotateRight') img.style.transform = 'rotate(90deg)';
+      else if (data.orientation === 'rotateLeft') img.style.transform = 'rotate(-90deg)';
+      else if (data.orientation === 'rotate180') img.style.transform = 'rotate(180deg)';
+      out.appendChild(img);
+    } else {
+      out.innerHTML = '<div style="margin-top:12px;color:#dc2626;">' + esc(data.error) + '</div>';
+    }
+  } catch (e) {
+    out.innerHTML = '<div style="margin-top:12px;color:#dc2626;">' + esc(e.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = 'Screenshot';
+}
+
+async function applyDisplayMode(auto) {
+  const out = document.getElementById('diagResult');
+  const w = document.getElementById('outW').value.trim();
+  const h = document.getElementById('outH').value.trim();
+  const r = document.getElementById('outR').value.trim() || '60';
+  if (!auto && (!w || !h)) { alert('Vul breedte en hoogte in pixels in'); return; }
+  const what = auto ? 'de automatische (preferred) mode' : (w + 'x' + h + '@' + r);
+  if (!confirm('Uitvoerresolutie instellen op ' + what + '? De player HERSTART om dit toe te passen.')) return;
+  const btn = document.getElementById(auto ? 'resAutoBtn' : 'resBtn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Toepassen...';
+  try {
+    const data = await api('/display-mode', Object.assign(modalCreds(),
+      auto ? {auto: true} : {width: w, height: h, refresh: r}));
+    if (data.success) {
+      out.innerHTML = '<div style="margin-top:12px;padding:12px;background:#f0fdf4;border-radius:6px;border:1px solid #bbf7d0;font-size:13px;">' +
+        '<strong style="color:#16a34a;">Resolutie ingesteld: ' + esc(data.mode) + '</strong><br>' +
+        'De player herstart nu. Na de herstart kun je met "Test verbinding" de nieuwe mode controleren.</div>';
+    } else {
+      out.innerHTML = '<div style="margin-top:12px;color:#dc2626;">' + esc(data.error) + '</div>';
+    }
+  } catch (e) {
+    out.innerHTML = '<div style="margin-top:12px;color:#dc2626;">' + esc(e.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = auto ? 'Auto' : 'Resolutie toepassen';
 }
 
 async function startFirmware() {
@@ -1736,19 +1863,32 @@ async function testConnection() {
       const hasKiosk = (info.features || []).some(f => f.includes('KIOSK'));
       const d = document.createElement('div');
       d.style.cssText = 'margin-top:12px;padding:12px;background:#f0fdf4;border-radius:6px;border:1px solid #bbf7d0;';
+      const resLine = esc(info.resolution||'?') +
+        (info.refresh ? ' @' + esc(info.refresh) + 'Hz' : '') +
+        (info.colorspace ? ' ' + esc(info.colorspace) : '') +
+        (info.outputType ? ' (' + esc(info.outputType) + ')' : '');
       d.innerHTML = '<strong style="color:#16a34a;">Verbinding OK</strong><br>' +
         '<span style="font-size:13px;color:#555;">' +
         'Firmware: ' + esc(info.firmware||'?') +
-        ' | Resolutie: ' + esc(info.resolution||'?') +
         ' | Temp: ' + esc(info.temp||'?') + '&deg;C' +
+        ' | Stand: ' + esc(info.orientation||'?') +
         ' | Licentie: ' + (hasKiosk ? '<span class="badge badge-kiosk">KIOSK</span>' : '<span class="badge badge-no">Geen KIOSK</span>') +
+        '<br>Uitvoerresolutie: <strong>' + resLine + '</strong>' +
+        ' | Video-mode: ' + esc(info.videoMode||'?') +
         '</span>';
+      // Pre-fill the output-resolution inputs with the player's current values
+      const rm = (info.resolution||'').match(/^(\\d+)x(\\d+)$/);
+      if (rm) { document.getElementById('outW').value = rm[1]; document.getElementById('outH').value = rm[2]; }
+      if (info.refresh) document.getElementById('outR').value = info.refresh;
       result.innerHTML = '';
       result.appendChild(d);
       document.getElementById('provisionBtn').disabled = false;
       document.getElementById('pushOnlyBtn').disabled = false;
       document.getElementById('diagBtn').disabled = false;
       document.getElementById('fwBtn').disabled = false;
+      document.getElementById('shotBtn').disabled = false;
+      document.getElementById('resBtn').disabled = false;
+      document.getElementById('resAutoBtn').disabled = false;
     } else {
       result.innerHTML = '<div style="margin-top:12px;padding:12px;background:#fef2f2;border-radius:6px;border:1px solid #fecaca;">' +
         '<strong style="color:#dc2626;">Verbinding mislukt</strong><br>' +
@@ -2015,6 +2155,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(update_firmware(body['ip'], body['username'], body['password'],
                                        repo_uri=str(body.get('repo_uri', '')).strip(),
                                        repo_id=str(body.get('repo_id', '')).strip()))
+
+        elif self.path == '/api/display-mode':
+            err = _require_fields(body, 'ip', 'username', 'password')
+            if err:
+                self._json_error(err, 400); return
+            if not _validate_ip(body['ip']):
+                self._json_error('Ongeldig IP-adres', 400); return
+            self._json(set_display_mode(
+                body['ip'], body['username'], body['password'],
+                width=body.get('width', 0), height=body.get('height', 0),
+                refresh=body.get('refresh', 60), auto=bool(body.get('auto', False))))
 
         elif self.path == '/api/firmware-status':
             err = _require_fields(body, 'ip', 'username', 'password')
