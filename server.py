@@ -1455,6 +1455,7 @@ HTML_BYTES = '''<!DOCTYPE html>
       <button class="btn btn-primary btn-sm" onclick="screenshotAll()" id="shotAllBtn">Screenshots van alle players</button>
       <button class="btn btn-primary btn-sm" onclick="checkFwAll()" id="fwAllBtn">Firmware controleren</button>
       <button class="btn btn-warning btn-sm" onclick="upgradeAll()" id="upgradeAllBtn">Bridge bijwerken op alle players</button>
+      <button class="btn btn-warning btn-sm" onclick="updateFwAll()" id="fwUpdateAllBtn">Firmware bijwerken (waar nodig)</button>
       <button class="btn btn-warning btn-sm" onclick="rebootAll()" id="rebootAllBtn">Herstart alle players</button>
       <span id="upgradeAllStatus" style="font-size:13px;color:#555;margin-left:8px;"></span>
       <span id="shotStatus" class="shot-msg" style="max-width:none;"></span>
@@ -1725,6 +1726,43 @@ async function checkFwAll() {
   await Promise.all([worker(), worker(), worker(), worker()]);
   const n = players.filter(p => (fwStatus[p.ip]||{}).status === 'update_available').length;
   status.textContent = 'Firmware gecontroleerd' + (n ? ' — ' + n + ' player(s) met een nieuwere versie beschikbaar' : ' — alles actueel');
+  btn.disabled = false;
+}
+
+async function updateFwAll() {
+  const btn = document.getElementById('fwUpdateAllBtn');
+  const status = document.getElementById('shotStatus');
+  if (!players.length) { status.textContent = 'Nog geen players, scan eerst het netwerk.'; return; }
+  const creds = shotCreds();
+  if (!creds.password) { status.textContent = 'Vul eerst het wachtwoord in.'; return; }
+
+  // Make sure we know which players need an update: check any that are unknown.
+  const unchecked = players.filter(p => !fwStatus[p.ip] || (!fwStatus[p.ip].status && !fwStatus[p.ip].error));
+  if (unchecked.length) {
+    status.textContent = 'Eerst firmware controleren...';
+    await checkFwAll();
+  }
+  const targets = players.filter(p => (fwStatus[p.ip]||{}).status === 'update_available');
+  if (!targets.length) { status.textContent = 'Alle players zijn actueel — niets bij te werken.'; return; }
+  if (!confirm(targets.length + ' player(s) hebben een nieuwere firmware. Nu bijwerken? Elke betreffende player downloadt op de achtergrond en HERSTART om de update toe te passen.')) return;
+
+  btn.disabled = true;
+  const queue = targets.slice();
+  let done = 0, okCount = 0, fails = [];
+  status.textContent = 'Firmware bijwerken: 0 van ' + queue.length;
+  const worker = async () => {
+    while (queue.length) {
+      const p = queue.shift();
+      try {
+        const data = await api('/firmware', {ip: p.ip, username: creds.username, password: creds.password});
+        if (data.success) okCount++; else fails.push(p.ip + ': ' + (data.error||'mislukt'));
+      } catch (e) { fails.push(p.ip + ': ' + e.message); }
+      done++;
+      status.textContent = 'Firmware bijwerken: ' + done + ' van ' + targets.length;
+    }
+  };
+  await Promise.all([worker(), worker()]);
+  status.textContent = okCount + ' van ' + done + ' update(s) gestart' + (fails.length ? ' — mislukt: ' + fails.join('; ') : '') + '. De players herstarten zelf.';
   btn.disabled = false;
 }
 
