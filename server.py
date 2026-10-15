@@ -1374,6 +1374,10 @@ HTML_BYTES = '''<!DOCTYPE html>
   .badge-kiosk { background: #dbeafe; color: #1d4ed8; }
   .badge-no { background: #fee2e2; color: #dc2626; }
   .badge-ok { background: #dcfce7; color: #16a34a; }
+  .help { margin-top: 10px; font-size: 13px; color: #555; }
+  .help summary { cursor: pointer; color: #2563eb; font-weight: 500; }
+  .help ul { margin: 10px 0 0 18px; }
+  .help li { margin-bottom: 6px; line-height: 1.45; }
 
   .modal .hint { font-size: 12px; color: #888; margin-top: 4px; }
   select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; width: 100%; background: white; }
@@ -1452,14 +1456,24 @@ HTML_BYTES = '''<!DOCTYPE html>
     <div class="shots-bar">
       <div class="f"><label for="shotUser">Username</label><input type="text" id="shotUser" value="admin" autocomplete="off"></div>
       <div class="f"><label for="shotPass">Wachtwoord</label><input type="password" id="shotPass" autocomplete="off"></div>
-      <button class="btn btn-primary btn-sm" onclick="screenshotAll()" id="shotAllBtn">Screenshots van alle players</button>
-      <button class="btn btn-primary btn-sm" onclick="checkFwAll()" id="fwAllBtn">Firmware controleren</button>
-      <button class="btn btn-warning btn-sm" onclick="upgradeAll()" id="upgradeAllBtn">Bridge bijwerken op alle players</button>
-      <button class="btn btn-warning btn-sm" onclick="updateFwAll()" id="fwUpdateAllBtn">Firmware bijwerken (waar nodig)</button>
-      <button class="btn btn-warning btn-sm" onclick="rebootAll()" id="rebootAllBtn">Herstart alle players</button>
+      <button class="btn btn-primary btn-sm" onclick="screenshotAll()" id="shotAllBtn" title="Haalt van elke gevonden player een live screenshot op.">Screenshots van alle players</button>
+      <button class="btn btn-primary btn-sm" onclick="checkFwAll()" id="fwAllBtn" title="Vergelijkt de firmware van elke player met de nieuwste in de officiele SpinetiX-repo. Vult de kolom Firmware.">Firmware controleren</button>
+      <button class="btn btn-warning btn-sm" onclick="upgradeAll()" id="upgradeAllBtn" title="Pusht de nieuwste bridge-code (nachtelijke refresh + zelfherstel + logs) naar elke player. Behoudt per player de eigen screen-URL; geen reboot.">Bridge bijwerken op alle players</button>
+      <button class="btn btn-warning btn-sm" onclick="updateFwAll()" id="fwUpdateAllBtn" title="Controleert eerst en werkt alleen players bij waar een nieuwere firmware beschikbaar is. Die players herstarten.">Firmware bijwerken (waar nodig)</button>
+      <button class="btn btn-warning btn-sm" onclick="rebootAll()" id="rebootAllBtn" title="Herstart alle gevonden players. Scherm is ~1-2 min zwart.">Herstart alle players</button>
       <span id="upgradeAllStatus" style="font-size:13px;color:#555;margin-left:8px;"></span>
       <span id="shotStatus" class="shot-msg" style="max-width:none;"></span>
     </div>
+    <details class="help">
+      <summary>Wat doen deze knoppen?</summary>
+      <ul>
+        <li><strong>Screenshots van alle players</strong> &mdash; haalt van elke player een live screenshot op.</li>
+        <li><strong>Firmware controleren</strong> &mdash; vergelijkt de firmware van elke player met de nieuwste in de officiele SpinetiX-repo en toont per player <em>actueel</em> of <em>nieuwer beschikbaar</em> in de kolom Firmware.</li>
+        <li><strong>Bridge bijwerken op alle players</strong> &mdash; pusht de nieuwste bridge-code naar elke player: de watchdog (ververst het scherm 's nachts om 03:00 en herstelt na een storing) plus de log-ringbuffer. De content blijft per player ongewijzigd; geen herstart.</li>
+        <li><strong>Firmware bijwerken (waar nodig)</strong> &mdash; werkt alleen de players bij waar een nieuwere firmware beschikbaar is; die herstarten zelf. De rest blijft ongemoeid. (Vereist op HMP400/iBX de SYSTEMS-licentie.)</li>
+        <li><strong>Herstart alle players</strong> &mdash; herstart de hele vloot; schermen ~1-2 min zwart.</li>
+      </ul>
+    </details>
     <div id="playerList">
       <div class="empty">Klik op "Scan netwerk" om te beginnen</div>
     </div>
@@ -1492,7 +1506,7 @@ HTML_BYTES = '''<!DOCTYPE html>
           </div>
         </div>
         <div class="btn-row">
-          <button class="btn btn-warning" onclick="testConnection()" id="testBtn">Test verbinding</button>
+          <button class="btn btn-warning" onclick="testConnection()" id="testBtn" title="Controleert de login en toont firmware, licentie, resolutie en de firmware-status. De andere acties worden pas daarna actief.">Test verbinding</button>
         </div>
         <div id="authResult"></div>
       </div>
@@ -1528,8 +1542,8 @@ HTML_BYTES = '''<!DOCTYPE html>
           <input type="text" id="outH" inputmode="numeric" placeholder="Hoogte" style="width:90px;">
           <span style="color:#888;">@</span>
           <input type="text" id="outR" inputmode="numeric" placeholder="Hz" value="60" style="width:60px;">
-          <button class="btn btn-warning btn-sm" onclick="applyDisplayMode(false)" id="resBtn" disabled>Resolutie toepassen</button>
-          <button class="btn btn-sm" onclick="applyDisplayMode(true)" id="resAutoBtn" disabled>Auto</button>
+          <button class="btn btn-warning btn-sm" onclick="applyDisplayMode(false)" id="resBtn" disabled title="Zet het HDMI/DP-uitvoersignaal op de ingevoerde resolutie. De player herstart.">Resolutie toepassen</button>
+          <button class="btn btn-sm" onclick="applyDisplayMode(true)" id="resAutoBtn" disabled title="Zet de uitvoerresolutie terug naar automatisch (preferred mode). De player herstart.">Auto</button>
         </div>
         <p class="hint">Handmatig in pixels, bijv. 4K-player naar Full HD: 1920 x 1080 @ 60. De player <strong>herstart</strong> om de mode toe te passen. Let op: op HMP400/iBX vereist dit de SYSTEMS-licentie.</p>
       </div>
@@ -1538,16 +1552,28 @@ HTML_BYTES = '''<!DOCTYPE html>
         <div class="section-title">Acties</div>
         <div class="btn-row">
           <span class="row-label">Uitrollen</span>
-          <button class="btn btn-success" onclick="startProvision()" id="provisionBtn" disabled>Provision + Push</button>
-          <button class="btn btn-primary" onclick="startPushOnly()" id="pushOnlyBtn" disabled>Alleen content pushen</button>
+          <button class="btn btn-success" onclick="startProvision()" id="provisionBtn" disabled title="Eerste keer per player: schakelt de ARYA-cloud uit, herstart, en pusht de bridge + content. Duurt 1-5 min.">Provision + Push</button>
+          <button class="btn btn-primary" onclick="startPushOnly()" id="pushOnlyBtn" disabled title="Pusht de bridge + screen-URL opnieuw, zonder cloud uit te schakelen of te herstarten. Voor al-geprovisionde players of een nieuwe URL.">Alleen content pushen</button>
         </div>
         <div class="btn-row">
           <span class="row-label">Hulpmiddelen</span>
-          <button class="btn btn-primary" onclick="fetchDiagnostics()" id="diagBtn" disabled>Diagnose / logs</button>
-          <button class="btn btn-primary" onclick="modalScreenshot()" id="shotBtn" disabled>Screenshot</button>
-          <button class="btn btn-warning" onclick="modalReboot()" id="rebootBtn" disabled>Herstart</button>
-          <button class="btn btn-warning" onclick="startFirmware()" id="fwBtn" disabled>Firmware bijwerken</button>
+          <button class="btn btn-primary" onclick="fetchDiagnostics()" id="diagBtn" disabled title="Leest /info van de player: uptime, temperatuur, boot-reason en content-/verbindingsfouten (fileErrors).">Diagnose / logs</button>
+          <button class="btn btn-primary" onclick="modalScreenshot()" id="shotBtn" disabled title="Haalt nu een live screenshot op en toont die hieronder.">Screenshot</button>
+          <button class="btn btn-warning" onclick="modalReboot()" id="rebootBtn" disabled title="Herstart deze player. Scherm is ~1-2 min zwart.">Herstart</button>
+          <button class="btn btn-warning" onclick="startFirmware()" id="fwBtn" disabled title="Start een firmware-update vanaf de officiele SpinetiX-repo voor dit model. De player herstart. Vereist op HMP400/iBX de SYSTEMS-licentie.">Firmware bijwerken</button>
         </div>
+        <details class="help">
+          <summary>Wat doet elke knop?</summary>
+          <ul>
+            <li><strong>Provision + Push</strong> &mdash; eerste setup: ARYA-cloud uit, herstart, bridge + content erop. Toont daarna de claim-code voor het CMS.</li>
+            <li><strong>Alleen content pushen</strong> &mdash; (her)pusht de bridge + screen-URL zonder cloud uit te schakelen of te herstarten. Voor een nieuwe URL of een bridge-update op een al-geprovisionde player.</li>
+            <li><strong>Diagnose / logs</strong> &mdash; leest de status van de player (uptime, temp, boot-reason) en de content-/verbindingsfouten.</li>
+            <li><strong>Screenshot</strong> &mdash; haalt nu een live beeld op van wat de player toont.</li>
+            <li><strong>Herstart</strong> &mdash; herstart alleen deze player.</li>
+            <li><strong>Firmware bijwerken</strong> &mdash; installeert de nieuwste firmware vanaf SpinetiX; de player herstart.</li>
+            <li><strong>Resolutie toepassen / Auto</strong> (hierboven) &mdash; zet het HDMI/DP-uitvoersignaal op een vaste resolutie of terug naar automatisch. De player herstart.</li>
+          </ul>
+        </details>
       </div>
 
       <div id="diagResult"></div>
