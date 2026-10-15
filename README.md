@@ -64,6 +64,12 @@ Knop boven de lijst. Werkt de geharde bridge (watchdog + logs, zie onder) bij op
 ### Diagnose / logs
 In het configuratievenster (na "Test verbinding"). Leest het `/info`-rapport van de player: uptime, temperatuur, boot-reason, safe mode én de `fileErrors`-lijst — daar verschijnen content-/verbindingsfouten (zoals een mislukte CMS-heartbeat). Dit is de device-kant; de app-logs van de bridge zelf worden door de bridge naar `POST /device/logs/{authHash}` gestuurd (zie onder).
 
+### Firmware-versie controleren
+In het configuratievenster toont "Test verbinding" nu ook de **huidige firmware** met een badge: **actueel** (groen) of **nieuwer beschikbaar: X.Y.Z** (oranje). De tool bepaalt de nieuwste versie uit de officiële SpinetiX-repo (`repodata/…-spxdata.xml.gz`, pakket `fw-spinetix-<model>`) en vergelijkt op ver+rel. Op de homepagina doet **Firmware controleren** dit voor alle gevonden players (kolom Firmware in de tabel); het resultaat wordt 1 uur gecachet.
+
+### Herstarten
+**Herstart** in het configuratievenster (RPC `restart`), of **Herstart alle players** op de homepagina voor de hele vloot. Het scherm is ~1–2 min zwart tijdens de reboot.
+
 ### Firmware bijwerken
 In het configuratievenster. Start een firmware-update vanaf de officiële SpinetiX-repository voor het gedetecteerde model (bv. HMP400 → `download.spinetix.com/hmp400/updates/`) via de RPC `firmware_update`. De player downloadt op de achtergrond en past de update toe bij de volgende herstart. Let op: de exacte RPC-parameters zijn niet publiek gedocumenteerd — bevestig de werking eerst op één player; een verkeerde parametervorm geeft een foutmelding en installeert niets.
 

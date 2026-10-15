@@ -14,6 +14,7 @@ import threading
 import time
 import ssl
 import base64
+import gzip
 import ipaddress
 import socket
 import shutil
@@ -1224,6 +1225,94 @@ def update_firmware(ip, username, password, repo_uri='', repo_id=''):
             'model': model, 'repo_uri': repo_uri}
 
 
+def reboot_player(ip, username, password):
+    """Reboot the player via the RPC restart method."""
+    try:
+        _rpc_call(ip, 'restart', [], username, password, timeout=15)
+        return {'success': True}
+    except Exception as e:
+        return {'success': False, 'error': f'Herstart mislukt: {_describe_error(e)}'}
+
+
+_LATEST_FW_CACHE = {}  # model -> (timestamp, 'ver-rel' or None)
+
+def _latest_firmware(model):
+    """Look up the newest firmware for a model in the official SpinetiX repo.
+    Reads repodata/*-spxdata.xml.gz and returns 'ver-rel' (e.g. '4.10.0-1.0.1')
+    or None. Cached for 1 hour so bulk checks hit the repo once."""
+    if not model:
+        return None
+    key = model.lower()
+    hit = _LATEST_FW_CACHE.get(key)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+
+    base = _fw_repo_for_model(model).rstrip('/')  # .../<model>/updates
+    pkg_name = 'fw-spinetix-' + key
+    latest = None
+    try:
+        # Find the spxdata file (its name carries a checksum) via repomd.xml,
+        # falling back to scraping the repodata directory listing.
+        repomd = urllib.request.urlopen(f'{base}/repodata/repomd.xml', timeout=12).read().decode('utf-8', 'replace')
+        m = re.search(r'(?:href|location href)="(repodata/[0-9a-f]+-spxdata\.xml\.gz)"', repomd)
+        if not m:
+            listing = urllib.request.urlopen(f'{base}/repodata/', timeout=12).read().decode('utf-8', 'replace')
+            m = re.search(r'([0-9a-f]+-spxdata\.xml\.gz)', listing)
+            spx_path = 'repodata/' + m.group(1) if m else None
+        else:
+            spx_path = m.group(1)
+        if not spx_path:
+            raise ValueError('spxdata not found')
+        spx_url = f'{base}/{spx_path}'
+        raw = urllib.request.urlopen(spx_url, timeout=15).read()
+        xml = gzip.decompress(raw).decode('utf-8', 'replace')
+        # Scan each package; keep the one whose <name> matches exactly.
+        for block in re.findall(r'<package\b.*?</package>', xml, re.DOTALL):
+            nm = re.search(r'<name>(.*?)</name>', block)
+            if not nm or nm.group(1).strip() != pkg_name:
+                continue
+            ver = re.search(r'<version[^>]*\bver="([^"]+)"', block)
+            rel = re.search(r'<version[^>]*\brel="([^"]+)"', block)
+            if ver:
+                cand = ver.group(1) + ('-' + rel.group(1) if rel else '')
+                if latest is None or _fw_tuple(cand) > _fw_tuple(latest):
+                    latest = cand
+    except Exception:
+        latest = None
+
+    _LATEST_FW_CACHE[key] = (time.time(), latest)
+    return latest
+
+
+def _fw_tuple(version):
+    """Comparable tuple from a firmware string like '4.10.0-1.0.1-2ee62d60'.
+    Uses the numeric ver and rel parts (ignores the trailing build hash)."""
+    nums = []
+    for part in version.split('-')[:2]:            # ver, rel
+        for n in part.split('.'):
+            nums.append(int(n) if n.isdigit() else 0)
+    return tuple(nums)
+
+
+def check_firmware(ip, username, password):
+    """Compare the player's firmware against the newest in the SpinetiX repo."""
+    try:
+        info = _rpc_call(ip, 'get_info', [], username, password, timeout=12).get('result', {})
+    except Exception as e:
+        return {'success': False, 'error': f'Kan versie niet ophalen: {_describe_error(e)}'}
+    current = (info.get('firmware', {}) or {}).get('version', '') if isinstance(info.get('firmware'), dict) else ''
+    model = info.get('model', '')
+    latest = _latest_firmware(model)
+    result = {'success': True, 'current': current, 'model': model, 'latest': latest}
+    if not current or not latest:
+        result['status'] = 'unknown'
+    elif _fw_tuple(current) >= _fw_tuple(latest):
+        result['status'] = 'up_to_date'
+    else:
+        result['status'] = 'update_available'
+    return result
+
+
 def firmware_status(ip, username, password, handle=None):
     """Poll an in-progress firmware update."""
     params = [handle] if handle is not None else []
@@ -1284,6 +1373,7 @@ HTML_BYTES = '''<!DOCTYPE html>
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
   .badge-kiosk { background: #dbeafe; color: #1d4ed8; }
   .badge-no { background: #fee2e2; color: #dc2626; }
+  .badge-ok { background: #dcfce7; color: #16a34a; }
 
   .modal .hint { font-size: 12px; color: #888; margin-top: 4px; }
   select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; width: 100%; background: white; }
@@ -1363,7 +1453,9 @@ HTML_BYTES = '''<!DOCTYPE html>
       <div class="f"><label for="shotUser">Username</label><input type="text" id="shotUser" value="admin" autocomplete="off"></div>
       <div class="f"><label for="shotPass">Wachtwoord</label><input type="password" id="shotPass" autocomplete="off"></div>
       <button class="btn btn-primary btn-sm" onclick="screenshotAll()" id="shotAllBtn">Screenshots van alle players</button>
+      <button class="btn btn-primary btn-sm" onclick="checkFwAll()" id="fwAllBtn">Firmware controleren</button>
       <button class="btn btn-warning btn-sm" onclick="upgradeAll()" id="upgradeAllBtn">Bridge bijwerken op alle players</button>
+      <button class="btn btn-warning btn-sm" onclick="rebootAll()" id="rebootAllBtn">Herstart alle players</button>
       <span id="upgradeAllStatus" style="font-size:13px;color:#555;margin-left:8px;"></span>
       <span id="shotStatus" class="shot-msg" style="max-width:none;"></span>
     </div>
@@ -1452,6 +1544,7 @@ HTML_BYTES = '''<!DOCTYPE html>
           <span class="row-label">Hulpmiddelen</span>
           <button class="btn btn-primary" onclick="fetchDiagnostics()" id="diagBtn" disabled>Diagnose / logs</button>
           <button class="btn btn-primary" onclick="modalScreenshot()" id="shotBtn" disabled>Screenshot</button>
+          <button class="btn btn-warning" onclick="modalReboot()" id="rebootBtn" disabled>Herstart</button>
           <button class="btn btn-warning" onclick="startFirmware()" id="fwBtn" disabled>Firmware bijwerken</button>
         </div>
       </div>
@@ -1475,6 +1568,7 @@ HTML_BYTES = '''<!DOCTYPE html>
 let players = [];
 let currentIp = '';
 const shots = {};  // ip -> {image, time} or {error} or {loading}; kept across rescans
+const fwStatus = {};  // ip -> {current, latest, status} or {loading} or {error}
 
 async function api(path, body) {
   const opts = {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})};
@@ -1550,7 +1644,7 @@ function renderPlayers() {
     return;
   }
   const table = document.createElement('table');
-  table.innerHTML = '<thead><tr><th>Status</th><th>Model</th><th>Serial</th><th>IP-adres</th><th>MAC</th><th>Via</th><th>Screenshot</th><th>Actie</th></tr></thead>';
+  table.innerHTML = '<thead><tr><th>Status</th><th>Model</th><th>Serial</th><th>IP-adres</th><th>MAC</th><th>Via</th><th>Firmware</th><th>Screenshot</th><th>Actie</th></tr></thead>';
   const tbody = document.createElement('tbody');
   players.forEach((p, i) => {
     const tr = document.createElement('tr');
@@ -1560,8 +1654,10 @@ function renderPlayers() {
       '<td><code>' + esc(p.ip) + '</code></td>' +
       '<td><code style="font-size:12px;">' + esc(p.mac) + '</code></td>' +
       '<td><span class="badge ' + (p.verified === false ? 'badge-warn' : 'badge-src') + '">' + esc(p.source || 'mDNS') + '</span></td>' +
+      '<td class="fw-cell"></td>' +
       '<td class="shot-cell"></td>' +
       '<td></td>';
+    tr.querySelector('.fw-cell').appendChild(renderFwCell(p));
     tr.querySelector('.shot-cell').appendChild(renderShotCell(p));
     const btn = document.createElement('button');
     btn.className = 'btn btn-primary btn-sm';
@@ -1580,6 +1676,83 @@ function shotCreds() {
     username: document.getElementById('shotUser').value.trim(),
     password: document.getElementById('shotPass').value,
   };
+}
+
+function renderFwCell(p) {
+  const wrap = document.createElement('div');
+  const f = fwStatus[p.ip];
+  if (f && f.loading) {
+    wrap.innerHTML = '<span class="shot-msg">Controleren...</span>';
+  } else if (f && f.error) {
+    wrap.innerHTML = '<span class="shot-msg err">' + esc(f.error) + '</span>';
+  } else if (f && f.current) {
+    let badge = '';
+    if (f.status === 'up_to_date') badge = '<span class="badge badge-ok">actueel</span>';
+    else if (f.status === 'update_available') badge = '<span class="badge badge-warn">nieuw: ' + esc(f.latest) + '</span>';
+    else badge = '<span class="badge badge-src">?</span>';
+    wrap.innerHTML = '<code style="font-size:12px;">' + esc(f.current) + '</code><br>' + badge;
+  } else {
+    wrap.innerHTML = '<span class="shot-msg">&ndash;</span>';
+  }
+  return wrap;
+}
+
+async function checkFwAll() {
+  const btn = document.getElementById('fwAllBtn');
+  const status = document.getElementById('shotStatus');
+  if (!players.length) { status.textContent = 'Nog geen players, scan eerst het netwerk.'; return; }
+  const creds = shotCreds();
+  if (!creds.password) { status.textContent = 'Vul eerst het wachtwoord in.'; return; }
+  btn.disabled = true;
+  const queue = players.slice();
+  let done = 0;
+  players.forEach(p => { fwStatus[p.ip] = {loading: true}; });
+  renderPlayers();
+  status.textContent = 'Firmware controleren: 0 van ' + queue.length;
+  const worker = async () => {
+    while (queue.length) {
+      const p = queue.shift();
+      try {
+        const data = await api('/firmware-check', {ip: p.ip, username: creds.username, password: creds.password});
+        fwStatus[p.ip] = data.success ? {current: data.current, latest: data.latest, status: data.status}
+                                      : {error: data.error || 'mislukt'};
+      } catch (e) { fwStatus[p.ip] = {error: e.message}; }
+      done++;
+      status.textContent = 'Firmware controleren: ' + done + ' van ' + players.length;
+      renderPlayers();
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  const n = players.filter(p => (fwStatus[p.ip]||{}).status === 'update_available').length;
+  status.textContent = 'Firmware gecontroleerd' + (n ? ' — ' + n + ' player(s) met een nieuwere versie beschikbaar' : ' — alles actueel');
+  btn.disabled = false;
+}
+
+async function rebootAll() {
+  const btn = document.getElementById('rebootAllBtn');
+  const status = document.getElementById('shotStatus');
+  if (!players.length) { status.textContent = 'Nog geen players, scan eerst het netwerk.'; return; }
+  const creds = shotCreds();
+  if (!creds.password) { status.textContent = 'Vul eerst het wachtwoord in.'; return; }
+  if (!confirm('ALLE ' + players.length + ' gevonden players herstarten? De schermen zijn ~1-2 min zwart tijdens de reboot.')) return;
+  btn.disabled = true;
+  const queue = players.slice();
+  let done = 0, okCount = 0, fails = [];
+  status.textContent = 'Herstarten: 0 van ' + queue.length;
+  const worker = async () => {
+    while (queue.length) {
+      const p = queue.shift();
+      try {
+        const data = await api('/reboot', {ip: p.ip, username: creds.username, password: creds.password});
+        if (data.success) okCount++; else fails.push(p.ip);
+      } catch (e) { fails.push(p.ip); }
+      done++;
+      status.textContent = 'Herstarten: ' + done + ' van ' + players.length;
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  status.textContent = okCount + ' van ' + done + ' herstart' + (fails.length ? ' — mislukt: ' + fails.join(', ') : '');
+  btn.disabled = false;
 }
 
 function renderShotCell(p) {
@@ -1742,6 +1915,7 @@ function openModal(ip, model, serial) {
   document.getElementById('diagBtn').disabled = true;
   document.getElementById('fwBtn').disabled = true;
   document.getElementById('shotBtn').disabled = true;
+  document.getElementById('rebootBtn').disabled = true;
   document.getElementById('resBtn').disabled = true;
   document.getElementById('resAutoBtn').disabled = true;
   document.getElementById('outW').value = '';
@@ -1792,6 +1966,45 @@ async function fetchDiagnostics() {
     out.innerHTML = '<div style="margin-top:12px;color:#dc2626;">' + esc(e.message) + '</div>';
   }
   btn.disabled = false; btn.textContent = 'Diagnose / logs';
+}
+
+async function checkModalFirmware() {
+  const result = document.getElementById('authResult');
+  const line = document.createElement('div');
+  line.style.cssText = 'margin-top:8px;font-size:13px;color:#555;';
+  line.innerHTML = '<span class="spinner"></span>Firmware controleren...';
+  result.appendChild(line);
+  try {
+    const data = await api('/firmware-check', modalCreds());
+    if (data.success) {
+      fwStatus[currentIp] = {current: data.current, latest: data.latest, status: data.status};
+      let badge;
+      if (data.status === 'up_to_date') badge = '<span class="badge badge-ok">actueel</span>';
+      else if (data.status === 'update_available') badge = '<span class="badge badge-warn">nieuwer beschikbaar: ' + esc(data.latest) + '</span>';
+      else badge = '<span class="badge badge-src">onbekend</span>';
+      line.innerHTML = 'Firmware: <code>' + esc(data.current || '?') + '</code> ' + badge;
+    } else {
+      line.innerHTML = 'Firmware-check: <span style="color:#dc2626;">' + esc(data.error) + '</span>';
+    }
+  } catch (e) {
+    line.innerHTML = 'Firmware-check: <span style="color:#dc2626;">' + esc(e.message) + '</span>';
+  }
+}
+
+async function modalReboot() {
+  if (!confirm('Deze player herstarten? Het scherm is ~1-2 min zwart.')) return;
+  const btn = document.getElementById('rebootBtn');
+  const out = document.getElementById('diagResult');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Herstarten...';
+  try {
+    const data = await api('/reboot', modalCreds());
+    out.innerHTML = data.success
+      ? '<div style="margin-top:12px;padding:12px;background:#fffbeb;border-radius:6px;border:1px solid #fde68a;font-size:13px;">Herstart gestart. De player is over 1-2 minuten weer online.</div>'
+      : '<div style="margin-top:12px;color:#dc2626;">' + esc(data.error) + '</div>';
+  } catch (e) {
+    out.innerHTML = '<div style="margin-top:12px;color:#dc2626;">' + esc(e.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = 'Herstart';
 }
 
 async function modalScreenshot() {
@@ -1920,8 +2133,10 @@ async function testConnection() {
       document.getElementById('diagBtn').disabled = false;
       document.getElementById('fwBtn').disabled = false;
       document.getElementById('shotBtn').disabled = false;
+      document.getElementById('rebootBtn').disabled = false;
       document.getElementById('resBtn').disabled = false;
       document.getElementById('resAutoBtn').disabled = false;
+      checkModalFirmware();
     } else {
       result.innerHTML = '<div style="margin-top:12px;padding:12px;background:#fef2f2;border-radius:6px;border:1px solid #fecaca;">' +
         '<strong style="color:#dc2626;">Verbinding mislukt</strong><br>' +
@@ -2188,6 +2403,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json(update_firmware(body['ip'], body['username'], body['password'],
                                        repo_uri=str(body.get('repo_uri', '')).strip(),
                                        repo_id=str(body.get('repo_id', '')).strip()))
+
+        elif self.path == '/api/reboot':
+            err = _require_fields(body, 'ip', 'username', 'password')
+            if err:
+                self._json_error(err, 400); return
+            if not _validate_ip(body['ip']):
+                self._json_error('Ongeldig IP-adres', 400); return
+            self._json(reboot_player(body['ip'], body['username'], body['password']))
+
+        elif self.path == '/api/firmware-check':
+            err = _require_fields(body, 'ip', 'username', 'password')
+            if err:
+                self._json_error(err, 400); return
+            if not _validate_ip(body['ip']):
+                self._json_error('Ongeldig IP-adres', 400); return
+            self._json(check_firmware(body['ip'], body['username'], body['password']))
 
         elif self.path == '/api/display-mode':
             err = _require_fields(body, 'ip', 'username', 'password')
