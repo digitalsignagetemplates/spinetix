@@ -58,7 +58,26 @@ Boven de lijst met players vul je één keer username en wachtwoord in. Met **Sc
 ### URL wijzigen (Alleen content pushen)
 Voor al-geprovisioned players: direct een nieuwe screen URL pushen zonder reboot.
 
+### Bridge bijwerken op alle players (fleet rollout)
+Knop boven de lijst. Werkt de geharde bridge (watchdog + logs, zie onder) bij op **alle** gevonden players, 3 tegelijk. Per player leest de tool de **huidige** screen-URL, authHash en formaat uit de player en pusht alleen de nieuwe bridge-code terug — de content blijft dus per player behouden. Nieuw geprovisionde players krijgen de geharde bridge automatisch.
+
+### Diagnose / logs
+In het configuratievenster (na "Test verbinding"). Leest het `/info`-rapport van de player: uptime, temperatuur, boot-reason, safe mode én de `fileErrors`-lijst — daar verschijnen content-/verbindingsfouten (zoals een mislukte CMS-heartbeat). Dit is de device-kant; de app-logs van de bridge zelf worden door de bridge naar `POST /device/logs/{authHash}` gestuurd (zie onder).
+
+### Firmware bijwerken
+In het configuratievenster. Start een firmware-update vanaf de officiële SpinetiX-repository voor het gedetecteerde model (bv. HMP400 → `download.spinetix.com/hmp400/updates/`) via de RPC `firmware_update`. De player downloadt op de achtergrond en past de update toe bij de volgende herstart. Let op: de exacte RPC-parameters zijn niet publiek gedocumenteerd — bevestig de werking eerst op één player; een verkeerde parametervorm geeft een foutmelding en installeert niets.
+
 ## Bridge SVG
+
+### Watchdog (speelt altijd door)
+De bridge houdt het scherm actief, onafhankelijk van de screen-pagina:
+- **Nachtelijke hard-refresh** (standaard 03:00 lokale tijd): herlaadt de iframe via de betrouwbare SpinetiX-weg (`iframe.src` opnieuw zetten met cache-bust). Dit vóórkomt de interne, in de iframe onbetrouwbare `window.location.reload()` van de screen-pagina.
+- **Reachability-watchdog** (elke 2 min): is de screen-URL herhaaldelijk onbereikbaar en komt daarna terug, dan herlaadt de bridge het scherm → een korte storing herstelt vanzelf.
+- **Log-ringbuffer** (laatste 200 regels): reloads, watchdog-events en `navigator.onLine` worden verstuurd naar `POST /device/logs/{authHash}` bij elke reload en op het `getLogs`-commando.
+
+Timing staat in `server.py` (`BRIDGE_REFRESH_HOUR`, `BRIDGE_PROBE_INTERVAL_MS`, `BRIDGE_PROBE_FAILS_MAX`).
+
+
 
 De tool pusht een SVG naar de player die twee dingen doet:
 
@@ -114,5 +133,8 @@ De bridge SVG pollt naar deze endpoints die in het DST Connect platform gebouwd 
 - `GET /device/config/{authHash}` - config poll, retourneert screenUrl + pending commands
 - `POST /device/status/{authHash}` - status heartbeat met telemetrie
 - `POST /device/command/{id}/ack` - command acknowledgement
+- `POST /device/logs/{authHash}` - ontvangt de log-ringbuffer van de bridge (reason, uptimeMs, onLine, lines[])
+
+Nieuwe bridge-commando's (via de config-poll): `screenReload` (alleen iframe herladen) en `getLogs` (logbuffer nu versturen).
 
 Dit volgt hetzelfde patroon als de bestaande Android/webOS/Windows applet communicatie in het platform (`RdmController`).
