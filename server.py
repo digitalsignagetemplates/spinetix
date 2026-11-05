@@ -1290,6 +1290,23 @@ def update_firmware(ip, username, password, repo_uri='', repo_id=''):
             'model': model, 'repo_uri': repo_uri}
 
 
+def cleanup_old_vendor(ip, username, password):
+    """Remove only the previous vendor's remote-management setup (Pull Mode,
+    RPC concentrator, scheduled downloads, Cockpit). Leaves the published
+    content and the bridge untouched and does not reboot, so it is safe to run
+    on players that already show the new content."""
+    log = []
+    try:
+        failed, reboot = _clear_old_config(ip, username, password, log.append)
+    except Exception as e:
+        return {'success': False, 'error': f'Opruimen mislukt: {_describe_error(e)}'}
+    if '<pull-mode-disabled/>' in failed:
+        return {'success': False, 'steps': log,
+                'error': 'Pull Mode kon niet worden uitgezet (handmatig in Control Center of factory reset)'}
+    return {'success': True, 'steps': log, 'reboot_pending': reboot,
+            'warnings': [t for t in failed]}
+
+
 def reboot_player(ip, username, password):
     """Reboot the player via the RPC restart method."""
     try:
@@ -1524,6 +1541,7 @@ HTML_BYTES = '''<!DOCTYPE html>
       <button class="btn btn-primary btn-sm" onclick="screenshotAll()" id="shotAllBtn" title="Haalt van elke gevonden player een live screenshot op.">Screenshots van alle players</button>
       <button class="btn btn-primary btn-sm" onclick="checkFwAll()" id="fwAllBtn" title="Vergelijkt de firmware van elke player met de nieuwste in de officiele SpinetiX-repo. Vult de kolom Firmware.">Firmware controleren</button>
       <button class="btn btn-warning btn-sm" onclick="upgradeAll()" id="upgradeAllBtn" title="Pusht de nieuwste bridge-code (nachtelijke refresh + zelfherstel + logs) naar elke player. Behoudt per player de eigen screen-URL; geen reboot.">Bridge bijwerken op alle players</button>
+      <button class="btn btn-warning btn-sm" onclick="cleanupAll()" id="cleanupAllBtn" title="Zet Pull Mode, de RPC-concentrator, geplande downloads en Cockpit van de vorige leverancier uit op elke player. Laat de content en bridge ongemoeid; geen herstart.">Oude leverancier opruimen (alle players)</button>
       <button class="btn btn-warning btn-sm" onclick="updateFwAll()" id="fwUpdateAllBtn" title="Controleert eerst en werkt alleen players bij waar een nieuwere firmware beschikbaar is. Die players herstarten.">Firmware bijwerken (waar nodig)</button>
       <button class="btn btn-warning btn-sm" onclick="rebootAll()" id="rebootAllBtn" title="Herstart alle gevonden players. Scherm is ~1-2 min zwart.">Herstart alle players</button>
       <span id="upgradeAllStatus" style="font-size:13px;color:#555;margin-left:8px;"></span>
@@ -1535,6 +1553,7 @@ HTML_BYTES = '''<!DOCTYPE html>
         <li><strong>Screenshots van alle players</strong> &mdash; haalt van elke player een live screenshot op.</li>
         <li><strong>Firmware controleren</strong> &mdash; vergelijkt de firmware van elke player met de nieuwste in de officiele SpinetiX-repo en toont per player <em>actueel</em> of <em>nieuwer beschikbaar</em> in de kolom Firmware.</li>
         <li><strong>Bridge bijwerken op alle players</strong> &mdash; pusht de nieuwste bridge-code naar elke player: de watchdog (ververst het scherm 's nachts om 03:00 en herstelt na een storing) plus de log-ringbuffer. De content blijft per player ongewijzigd; geen herstart.</li>
+        <li><strong>Oude leverancier opruimen (alle players)</strong> &mdash; zet Pull Mode (inclusief RPC-concentrator), geplande downloads en Cockpit-monitoring uit, zodat een speler niet meer terugvalt naar het oude CMS. Content en bridge blijven staan; geen herstart. Meldt per player of een herstart nodig is of Pull Mode niet uit wilde.</li>
         <li><strong>Firmware bijwerken (waar nodig)</strong> &mdash; werkt alleen de players bij waar een nieuwere firmware beschikbaar is; die herstarten zelf. De rest blijft ongemoeid. (Vereist op HMP400/iBX de SYSTEMS-licentie.)</li>
         <li><strong>Herstart alle players</strong> &mdash; herstart de hele vloot; schermen ~1-2 min zwart.</li>
       </ul>
@@ -2012,6 +2031,36 @@ async function upgradeAll() {
   };
   await Promise.all([worker(), worker(), worker()]);
   status.textContent = okCount + ' van ' + done + ' bijgewerkt' + (fails.length ? ' — mislukt: ' + fails.join('; ') : '');
+  btn.disabled = false;
+}
+
+async function cleanupAll() {
+  const btn = document.getElementById('cleanupAllBtn');
+  const status = document.getElementById('upgradeAllStatus');
+  if (!players.length) { status.textContent = 'Nog geen players, scan eerst het netwerk.'; return; }
+  const creds = shotCreds();
+  if (!creds.password) { status.textContent = 'Vul eerst het wachtwoord in.'; return; }
+  if (!confirm('Pull Mode, RPC-concentrator, geplande downloads en Cockpit van de oude leverancier uitzetten op alle ' + players.length + ' gevonden players? Content en bridge blijven ongewijzigd, er is geen herstart.')) return;
+  btn.disabled = true;
+  const queue = players.slice();
+  let done = 0, okCount = 0, fails = [], restart = [];
+  status.textContent = 'Bezig: 0 van ' + queue.length;
+  const worker = async () => {
+    while (queue.length) {
+      const p = queue.shift();
+      try {
+        const data = await api('/cleanup', {ip: p.ip, username: creds.username, password: creds.password});
+        if (data.success) { okCount++; if (data.reboot_pending) restart.push(p.ip); }
+        else fails.push(p.ip + ': ' + (data.error||'mislukt'));
+      } catch (e) { fails.push(p.ip + ': ' + e.message); }
+      done++;
+      status.textContent = 'Bezig: ' + done + ' van ' + players.length;
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  status.textContent = okCount + ' van ' + done + ' opgeruimd'
+    + (restart.length ? ' — herstart nodig: ' + restart.join(', ') : '')
+    + (fails.length ? ' — mislukt: ' + fails.join('; ') : '');
   btn.disabled = false;
 }
 
@@ -2515,6 +2564,14 @@ class Handler(BaseHTTPRequestHandler):
             if not _validate_ip(body['ip']):
                 self._json_error('Ongeldig IP-adres', 400); return
             self._json(upgrade_bridge(body['ip'], body['username'], body['password']))
+
+        elif self.path == '/api/cleanup':
+            err = _require_fields(body, 'ip', 'username', 'password')
+            if err:
+                self._json_error(err, 400); return
+            if not _validate_ip(body['ip']):
+                self._json_error('Ongeldig IP-adres', 400); return
+            self._json(cleanup_old_vendor(body['ip'], body['username'], body['password']))
 
         elif self.path == '/api/diagnostics':
             err = _require_fields(body, 'ip', 'username', 'password')
