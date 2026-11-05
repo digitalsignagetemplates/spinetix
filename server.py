@@ -643,6 +643,54 @@ def set_display_mode(ip, username, password, width=0, height=0, refresh=60, auto
     return {'success': False, 'error': errors or 'Resolutie niet ingesteld (mogelijk SYSTEMS-licentie vereist)'}
 
 
+# Settings of a previous CMS vendor that must not survive a migration. Players
+# that were managed in Pull Mode keep polling the old server (and keep their
+# old RPC concentrator / scheduled downloads) until these are cleared.
+# Each entry: (config tag, label for the log)
+OLD_CONFIG_CLEANUP = [
+    ('<pull-mode-disabled/>', 'Pull Mode uitgezet'),
+    ('<scheduled-download-reset/>', 'geplande downloads verwijderd'),
+    ('<cockpit-disabled/>', 'Cockpit-monitoring uitgezet'),
+]
+
+
+def _set_config_xml(ip, username, password, inner):
+    """Apply configuration tags. Returns (ok, error message)."""
+    xml = f'<configuration version="2.3">{inner}</configuration>'
+    result = _rpc_call(ip, 'set_config', [{'xmlconfig': xml}], username, password).get('result', {})
+    if result.get('success') or result.get('reboot_pending'):
+        return True, ''
+    errors = '; '.join(e.get('description', '') for e in result.get('errors', []) if isinstance(e, dict))
+    return False, errors or 'onbekende fout'
+
+
+def _clear_old_config(ip, username, password, log=print, reset_published=False):
+    """Remove the previous vendor's remote-management setup from the player:
+    Pull Mode (which also holds the RPC concentrator settings), scheduled
+    downloads and Cockpit monitoring. Optionally also clears the old published
+    project (only use before a fresh push). Tags the firmware rejects are
+    reported individually and do not block the rest. Returns a list of the
+    tags that could not be applied."""
+    items = list(OLD_CONFIG_CLEANUP)
+    if reset_published:
+        items.append(('<reset-published-content/>', 'oud gepubliceerd project verwijderd'))
+    ok, err = _set_config_xml(ip, username, password, ''.join(tag for tag, _ in items))
+    if ok:
+        for _, label in items:
+            log(f"Oude configuratie opgeruimd: {label}")
+        return []
+    # One tag may be unsupported on this firmware; find out which.
+    failed = []
+    for tag, label in items:
+        ok, err = _set_config_xml(ip, username, password, tag)
+        if ok:
+            log(f"Oude configuratie opgeruimd: {label}")
+        else:
+            failed.append(tag)
+            log(f"Waarschuwing: {tag} niet toegepast ({err})")
+    return failed
+
+
 def _build_svg(screen_url, auth_hash, width=1920, height=1080):
     """Build bridge SVG: iframe for content + JavaScript polling for RDM.
 
@@ -970,6 +1018,11 @@ def provision_player(ip, username, password, screen_url, mac='',
         auth_hash = _mac_to_auth_hash(mac)
         log(f"AuthHash: {auth_hash}")
 
+        # Step 0b: Remove the old vendor's Pull Mode / RPC concentrator setup,
+        # otherwise the player keeps fetching the old project and overwrites ours.
+        log("Oude configuratie (Pull Mode, concentrator, geplande downloads) opruimen...")
+        _clear_old_config(ip, username, password, log, reset_published=True)
+
         # Step 1: Disable cloud
         log("Cloud uitschakelen...")
         result = _rpc_call(ip, 'set_config', [{'xmlconfig':
@@ -1063,6 +1116,8 @@ def push_content_only(ip, username, password, screen_url, mac='',
         if not mac:
             return {'success': False, 'error': 'Kan MAC-adres niet ophalen'}
         auth_hash = _mac_to_auth_hash(mac)
+        # Also fixes players provisioned before the cleanup existed.
+        _clear_old_config(ip, username, password)
         err = _set_orientation(ip, username, password, orientation)
         if err:
             return {'success': False, 'error': err}

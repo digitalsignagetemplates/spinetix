@@ -23,6 +23,7 @@ Opent automatisch `http://localhost:8090` in de browser.
 2. **Configureren** - klik op een player, voer credentials + screen URL in
 3. **Test verbinding** - controleert auth, toont firmware/licentie/temperatuur
 4. **Provision + Push** - eenmalige setup (1 tot 5 minuten, afhankelijk van de herstart):
+   - Ruimt de configuratie van de vorige leverancier op: Pull Mode uit (`<pull-mode-disabled/>`, bevat ook de RPC-concentrator), geplande downloads weg (`<scheduled-download-reset/>`), Cockpit uit (`<cockpit-disabled/>`) en het oude gepubliceerde project weg (`<reset-published-content/>`). "Alleen content pushen" doet de eerste drie ook, zodat eerder geprovisioneerde players alsnog schoon worden
    - Schakelt ARYA cloud uit (`<disable-cloud/>`)
    - Herstart player
    - Pusht bridge SVG met content iframe + RDM polling script
