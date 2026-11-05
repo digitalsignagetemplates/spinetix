@@ -655,13 +655,13 @@ OLD_CONFIG_CLEANUP = [
 
 
 def _set_config_xml(ip, username, password, inner):
-    """Apply configuration tags. Returns (ok, error message)."""
+    """Apply configuration tags. Returns (ok, error message, reboot_pending)."""
     xml = f'<configuration version="2.3">{inner}</configuration>'
     result = _rpc_call(ip, 'set_config', [{'xmlconfig': xml}], username, password).get('result', {})
     if result.get('success') or result.get('reboot_pending'):
-        return True, ''
+        return True, '', bool(result.get('reboot_pending'))
     errors = '; '.join(e.get('description', '') for e in result.get('errors', []) if isinstance(e, dict))
-    return False, errors or 'onbekende fout'
+    return False, errors or 'onbekende fout', False
 
 
 def _clear_old_config(ip, username, password, log=print, reset_published=False):
@@ -669,26 +669,27 @@ def _clear_old_config(ip, username, password, log=print, reset_published=False):
     Pull Mode (which also holds the RPC concentrator settings), scheduled
     downloads and Cockpit monitoring. Optionally also clears the old published
     project (only use before a fresh push). Tags the firmware rejects are
-    reported individually and do not block the rest. Returns a list of the
-    tags that could not be applied."""
+    reported individually and do not block the rest. Returns (failed tags,
+    reboot_pending)."""
     items = list(OLD_CONFIG_CLEANUP)
     if reset_published:
         items.append(('<reset-published-content/>', 'oud gepubliceerd project verwijderd'))
-    ok, err = _set_config_xml(ip, username, password, ''.join(tag for tag, _ in items))
+    ok, err, reboot = _set_config_xml(ip, username, password, ''.join(tag for tag, _ in items))
     if ok:
         for _, label in items:
             log(f"Oude configuratie opgeruimd: {label}")
-        return []
+        return [], reboot
     # One tag may be unsupported on this firmware; find out which.
     failed = []
     for tag, label in items:
-        ok, err = _set_config_xml(ip, username, password, tag)
+        ok, err, pending = _set_config_xml(ip, username, password, tag)
         if ok:
+            reboot = reboot or pending
             log(f"Oude configuratie opgeruimd: {label}")
         else:
             failed.append(tag)
             log(f"Waarschuwing: {tag} niet toegepast ({err})")
-    return failed
+    return failed, reboot
 
 
 def _build_svg(screen_url, auth_hash, width=1920, height=1080):
@@ -1021,7 +1022,10 @@ def provision_player(ip, username, password, screen_url, mac='',
         # Step 0b: Remove the old vendor's Pull Mode / RPC concentrator setup,
         # otherwise the player keeps fetching the old project and overwrites ours.
         log("Oude configuratie (Pull Mode, concentrator, geplande downloads) opruimen...")
-        _clear_old_config(ip, username, password, log, reset_published=True)
+        failed, _ = _clear_old_config(ip, username, password, log, reset_published=True)
+        if '<pull-mode-disabled/>' in failed:
+            log("LET OP: Pull Mode kon niet worden uitgezet. Zet het handmatig uit in Control Center "
+                "(Advanced Applications > Pull Mode) of doe een factory reset, anders valt de player terug.")
 
         # Step 1: Disable cloud
         log("Cloud uitschakelen...")
@@ -1117,15 +1121,21 @@ def push_content_only(ip, username, password, screen_url, mac='',
             return {'success': False, 'error': 'Kan MAC-adres niet ophalen'}
         auth_hash = _mac_to_auth_hash(mac)
         # Also fixes players provisioned before the cleanup existed.
-        _clear_old_config(ip, username, password)
+        steps = []
+        failed, reboot = _clear_old_config(ip, username, password, steps.append)
+        if '<pull-mode-disabled/>' in failed:
+            steps.append("LET OP: Pull Mode kon niet worden uitgezet. Zet het handmatig uit in Control "
+                         "Center (Advanced Applications > Pull Mode) of doe een factory reset.")
+        elif reboot:
+            steps.append("LET OP: de player moet herstart worden om Pull Mode uit te zetten.")
         err = _set_orientation(ip, username, password, orientation)
         if err:
-            return {'success': False, 'error': err}
+            return {'success': False, 'steps': steps, 'error': err}
         svg = _build_svg(screen_url, auth_hash, *size)
         ok, err = _push_svg(ip, username, password, svg)
         if ok:
-            return {'success': True}
-        return {'success': False, 'error': err}
+            return {'success': True, 'steps': steps}
+        return {'success': False, 'steps': steps, 'error': err}
     except Exception as e:
         return {'success': False, 'error': f'Kan niet verbinden met player: {_describe_error(e)}'}
 
@@ -2348,6 +2358,7 @@ async function startPushOnly() {
       screen_url: url,
       ...displayOptions(),
     });
+    (data.steps || []).forEach(s => appendLog(log, s, s.startsWith('LET OP') || s.startsWith('Waarschuwing')));
     if (data.success) {
       appendLog(log, 'Content succesvol gepusht!', false);
       appendLog(log, '\\n--- VOLTOOID ---', false);
