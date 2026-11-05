@@ -9,6 +9,7 @@ Then open http://localhost:8090 in your browser.
 
 import json
 import os
+import sys
 import re
 import subprocess
 import threading
@@ -27,7 +28,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-VERSION = '1.2.0'  # bump on every user-visible change
+VERSION = '1.2.1'  # bump on every user-visible change
 
 
 def _git_revision():
@@ -2498,14 +2499,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', len(HTML_BYTES))
+            # Never let the browser show a cached (old) version of the page.
+            self.send_header('Cache-Control', 'no-store, max-age=0')
             self.end_headers()
             self.wfile.write(HTML_BYTES)
+        elif self.path == '/api/version':
+            body = json.dumps({'build': BUILD, 'version': VERSION}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(body))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
         if not self._check_origin():
+            return
+
+        if self.path == '/api/shutdown':
+            # Lets a newly started copy replace this (older) one. The custom
+            # header cannot be sent by a web page cross-origin.
+            if self.headers.get('X-Provisioner-Shutdown') != '1':
+                self._json_error('Niet toegestaan', 403); return
+            self._json({'success': True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
 
         body = self._read_body()
@@ -2691,10 +2711,44 @@ class ThreadedHTTPServer(HTTPServer):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+def _start_server(url):
+    """Bind the port. If an older copy still holds it (the usual reason the
+    browser keeps showing the old version), ask it to quit and take over; if it
+    is too old to understand that, say exactly how to stop it."""
+    try:
+        return ThreadedHTTPServer((BIND_HOST, PORT), Handler)
+    except OSError:
+        pass
+    old = 'onbekende versie (ouder dan v1.2.0)'
+    try:
+        with urllib.request.urlopen(url + '/api/version', timeout=3) as r:
+            old = json.loads(r.read().decode()).get('build', old)
+    except Exception:
+        pass
+    print(f'\nPoort {PORT} is al in gebruik door een andere kopie: {old}.')
+    print('Die oude kopie wordt gestopt...')
+    try:
+        req = urllib.request.Request(url + '/api/shutdown', data=b'{}', method='POST')
+        req.add_header('X-Provisioner-Shutdown', '1')
+        urllib.request.urlopen(req, timeout=3).read()
+    except Exception:
+        pass
+    for _ in range(10):
+        time.sleep(0.5)
+        try:
+            return ThreadedHTTPServer((BIND_HOST, PORT), Handler)
+        except OSError:
+            continue
+    print(f'\nLukt niet automatisch. Stop de oude kopie zelf en start opnieuw:')
+    print(f'  Mac/Linux:  lsof -ti tcp:{PORT} | xargs kill')
+    print(f'  Windows:    netstat -ano | findstr :{PORT}   en dan   taskkill /PID <nummer> /F')
+    sys.exit(1)
+
+
 if __name__ == '__main__':
     import webbrowser
-    server = ThreadedHTTPServer((BIND_HOST, PORT), Handler)
     url = f'http://localhost:{PORT}'
+    server = _start_server(url)
     print(f'\nSpinetiX Provisioner {BUILD} draait op {url}')
     print('Druk Ctrl+C om te stoppen.\n')
     threading.Timer(1, lambda: webbrowser.open(url)).start()

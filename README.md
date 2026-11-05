@@ -145,3 +145,6 @@ De bridge SVG pollt naar deze endpoints die in het DST Connect platform gebouwd 
 Nieuwe bridge-commando's (via de config-poll): `screenReload` (alleen iframe herladen) en `getLogs` (logbuffer nu versturen).
 
 Dit volgt hetzelfde patroon als de bestaande Android/webOS/Windows applet communicatie in het platform (`RdmController`).
+
+### Nieuwe versie starten
+Controleer in de kop van de pagina (of in de terminal) dat het versienummer klopt. Draait er nog een oude kopie op poort 8090 (de browser toont dan de oude oplossing), dan stopt de nieuwe kopie de oude automatisch. Is de oude te oud om dat te snappen (ouder dan v1.2.1), stop hem dan eenmalig met `lsof -ti tcp:8090 | xargs kill` (Mac/Linux) of via `netstat -ano | findstr :8090` en `taskkill /PID <nummer> /F` (Windows). De pagina wordt nooit uit de browser-cache getoond.
