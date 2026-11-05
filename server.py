@@ -26,6 +26,24 @@ from xml.sax.saxutils import escape as xml_escape
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
+VERSION = '1.2.0'  # bump on every user-visible change
+
+
+def _git_revision():
+    """Short commit hash of the checkout this process was started from, so a
+    stale (not restarted) process is recognisable. Empty when not a git checkout."""
+    import subprocess
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=here,
+                             capture_output=True, text=True, timeout=3)
+        return out.stdout.strip() if out.returncode == 0 else ''
+    except Exception:
+        return ''
+
+
+BUILD = f'v{VERSION}' + (f' ({_git_revision()})' if _git_revision() else '')
+
 PORT = 8090
 BIND_HOST = '127.0.0.1'  # localhost only, not exposed to network
 SCAN_TIMEOUT = 6  # seconds for mDNS browse
@@ -1506,7 +1524,7 @@ HTML_BYTES = '''<!DOCTYPE html>
 <body>
 
 <div class="header">
-  <h1>SpinetiX Provisioner</h1>
+  <h1>SpinetiX Provisioner <small style="font-size:13px;font-weight:400;color:#888;">__BUILD__</small></h1>
   <p>Scan, configureer en push content naar SpinetiX players</p>
 </div>
 
@@ -2432,7 +2450,7 @@ async function startPushOnly() {
 </body>
 </html>'''.replace('__ORIENTATION_OPTIONS__', ''.join(
     f'<option value="{key}">{label}</option>' for key, (label, _) in ORIENTATIONS.items()
-)).encode('utf-8')
+)).replace('__BUILD__', BUILD).encode('utf-8')
 
 
 def _display_options(body):
@@ -2676,7 +2694,7 @@ if __name__ == '__main__':
     import webbrowser
     server = ThreadedHTTPServer((BIND_HOST, PORT), Handler)
     url = f'http://localhost:{PORT}'
-    print(f'\nSpinetiX Provisioner draait op {url}')
+    print(f'\nSpinetiX Provisioner {BUILD} draait op {url}')
     print('Druk Ctrl+C om te stoppen.\n')
     threading.Timer(1, lambda: webbrowser.open(url)).start()
     try:
